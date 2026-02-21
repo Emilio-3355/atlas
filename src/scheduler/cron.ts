@@ -7,6 +7,7 @@ import { generateMorningBriefing } from './morning-briefing.js';
 import { runEvolutionCycle } from '../self-improvement/evolver.js';
 import { analyzeActivityPatterns } from './adaptive.js';
 import { promoteLearnigs } from '../self-improvement/promoter.js';
+import { detectStaleness } from '../self-improvement/staleness-detector.js';
 import logger from '../utils/logger.js';
 
 const tasks: cron.ScheduledTask[] = [];
@@ -73,6 +74,7 @@ export function startScheduler(): void {
       try {
         await analyzeActivityPatterns();
         await promoteLearnigs();
+        await detectStaleness();
       } catch (err) {
         logger.error('Pattern analysis failed', { error: err });
       }

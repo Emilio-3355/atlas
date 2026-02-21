@@ -6,6 +6,8 @@ import { detectMessageLanguage, respondToUser } from './responder.js';
 import { buildContext } from './context-engine.js';
 import { getToolRegistry } from '../tools/registry.js';
 import { shouldCompact, compactConversation } from '../memory/conversation.js';
+import { detectCorrection, handleCorrection } from '../self-improvement/correction-detector.js';
+import { detectStaleness, handleStalenessFromToolResult } from '../self-improvement/staleness-detector.js';
 import { query } from '../config/database.js';
 import logger from '../utils/logger.js';
 import type { AgentContext, AgentResponse, ReasoningDepth, ToolContext, PendingAction } from '../types/index.js';
@@ -27,6 +29,13 @@ export async function processMessage(phone: string, incomingMessage: string): Pr
 
   // Store incoming message
   await storeMessage(conversation.id, 'user', incomingMessage);
+
+  // Auto-detect corrections and outdated knowledge
+  const correctionSignal = detectCorrection(incomingMessage);
+  if (correctionSignal) {
+    await handleCorrection(conversation.id, incomingMessage, correctionSignal);
+    logger.debug('Correction detected', { type: correctionSignal.type, confidence: correctionSignal.confidence });
+  }
 
   // Load recent messages for context
   const recentMessages = await getRecentMessages(conversation.id, 20);
@@ -119,6 +128,15 @@ export async function processMessage(phone: string, incomingMessage: string): Pr
 
       // Log tool usage
       await logToolUsage(toolUseBlock.name, toolResult.success, Date.now() - startTime, conversation.id, toolResult.error);
+
+      // Staleness detection: check if tool results contradict previous knowledge
+      if (toolResult.success && toolResult.data) {
+        await handleStalenessFromToolResult(
+          toolUseBlock.name,
+          toolResult.data,
+          conversation.id,
+        ).catch((err) => logger.debug('Staleness check skipped', { error: err }));
+      }
 
       // If tool requires approval, handle the approval flow
       if (toolResult.requiresApproval && toolResult.approvalPreview) {
