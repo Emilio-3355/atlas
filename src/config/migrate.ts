@@ -13,16 +13,27 @@ async function migrate() {
     .filter((f) => f.endsWith('.sql'))
     .sort();
 
+  let failures = 0;
   for (const file of files) {
     console.log(`  Running ${file}...`);
     const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf-8');
     try {
       await query(sql);
       console.log(`  ✓ ${file}`);
-    } catch (err) {
-      console.error(`  ✗ ${file}:`, err);
-      throw err;
+    } catch (err: any) {
+      // Non-fatal: extension not available (Railway doesn't have pgvector)
+      // or "already exists" errors on re-run
+      const code = err?.code;
+      if (code === '0A000' || code === '42710' || code === '42P07') {
+        console.warn(`  ⚠ ${file}: non-fatal (${err.message?.slice(0, 80)}), continuing...`);
+      } else {
+        console.error(`  ✗ ${file}:`, err);
+        failures++;
+      }
     }
+  }
+  if (failures > 0) {
+    throw new Error(`${failures} migration(s) had fatal errors`);
   }
 
   console.log('All migrations complete.');

@@ -1,13 +1,12 @@
--- Atlas pgvector Memory (Phase 2)
+-- Atlas Memory (Phase 2) — pgvector-free (JSONB embeddings, cosine similarity in-app)
 
-CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
--- Semantic memory (pgvector)
+-- Semantic memory (JSONB embeddings — cosine similarity computed in application)
 CREATE TABLE IF NOT EXISTS memory_vectors (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   content TEXT NOT NULL,
-  embedding vector(1536),
+  embedding JSONB,
   metadata JSONB DEFAULT '{}',
   source VARCHAR(50),
   conversation_id UUID,
@@ -29,8 +28,7 @@ CREATE TABLE IF NOT EXISTS learnings (
   resolved_at TIMESTAMPTZ
 );
 
--- Indexes
-CREATE INDEX IF NOT EXISTS idx_memory_vectors_embedding ON memory_vectors USING hnsw (embedding vector_cosine_ops);
+-- Indexes (no HNSW — similarity computed in-app)
 CREATE INDEX IF NOT EXISTS idx_memory_facts_trgm ON memory_facts USING gin (value gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_memory_vectors_content_trgm ON memory_vectors USING gin (content gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_learnings_pattern ON learnings(pattern_hash);
