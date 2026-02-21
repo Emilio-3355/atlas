@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
-import { serveStatic } from '@hono/node-server/serve-static';
+import { readFileSync } from 'fs';
+import { resolve } from 'path';
 import { getEnv } from '../config/env.js';
 import { query } from '../config/database.js';
 import { getActiveTasks, cancelTask } from '../models/scheduled-task.js';
@@ -211,11 +212,18 @@ dashboardRouter.get('/api/audit', async (c) => {
   }
 });
 
-// ===== Static files for dashboard UI =====
-// Serve index.html at root
-dashboardRouter.get('/', serveStatic({ path: './public/control/index.html' }));
+// ===== Serve dashboard UI =====
+// Read index.html once at startup (single-file dashboard, no other static assets)
+let dashboardHtml = '';
+try {
+  dashboardHtml = readFileSync(resolve('public', 'control', 'index.html'), 'utf-8');
+} catch {
+  logger.warn('Dashboard HTML not found at public/control/index.html');
+}
 
-// Serve any other static assets from public/control/
-dashboardRouter.get('/*', serveStatic({ root: './public/control/' }));
+dashboardRouter.get('/', (c) => {
+  if (!dashboardHtml) return c.text('Dashboard not available', 404);
+  return c.html(dashboardHtml);
+});
 
 export default dashboardRouter;
