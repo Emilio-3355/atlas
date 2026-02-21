@@ -212,9 +212,10 @@ dashboardRouter.get('/api/audit', async (c) => {
 });
 
 // ===== Static files for dashboard UI =====
-dashboardRouter.get('/*', serveStatic({ root: './public/control/' }));
-
-// Fallback — serve index.html for SPA-style routing
+// Serve index.html at root
 dashboardRouter.get('/', serveStatic({ path: './public/control/index.html' }));
+
+// Serve any other static assets from public/control/
+dashboardRouter.get('/*', serveStatic({ root: './public/control/' }));
 
 export default dashboardRouter;
