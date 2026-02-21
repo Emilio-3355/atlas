@@ -5,7 +5,7 @@
 CREATE TABLE IF NOT EXISTS evolution_events (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   cycle_number INTEGER NOT NULL,
-  intent VARCHAR(20) NOT NULL CHECK (intent IN ('repair', 'optimize', 'innovate')),
+  intent VARCHAR(20) NOT NULL CHECK (intent IN ('repair', 'optimize', 'innovate', 'none', 'error')),
   signals JSONB NOT NULL DEFAULT '[]',
   proposals JSONB NOT NULL DEFAULT '[]',
   approved_proposals JSONB DEFAULT '[]',
