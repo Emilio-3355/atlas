@@ -21,4 +21,4 @@ RUN npm run build
 ENV NODE_ENV=production
 EXPOSE 3000
 
-CMD ["sh", "-c", "npx tsx src/config/migrate.ts && node dist/index.js"]
+CMD ["sh", "-c", "node dist/config/migrate.js && node dist/index.js"]
