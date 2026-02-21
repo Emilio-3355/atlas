@@ -1,0 +1,20 @@
+{
+  "name": "atlas-daemon",
+  "version": "1.0.0",
+  "description": "Atlas local daemon — runs on JP's Mac for remote control via WhatsApp",
+  "type": "module",
+  "scripts": {
+    "start": "tsx daemon/index.ts",
+    "dev": "tsx watch daemon/index.ts"
+  },
+  "dependencies": {
+    "ws": "^8.16.0",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "@types/ws": "^8.5.10",
+    "@types/node": "^22.12.0"
+  }
+}

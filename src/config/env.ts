@@ -28,6 +28,8 @@ const envSchema = z.object({
   BRAVE_SEARCH_API_KEY: z.string().default(''),
   FINNHUB_API_KEY: z.string().default(''),
 
+  DAEMON_SECRET: z.string().min(32).default(''),
+
   LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug']).default('info'),
 });
 

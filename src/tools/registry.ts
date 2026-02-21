@@ -106,6 +106,8 @@ export async function registerBuiltInToolsAsync(): Promise<void> {
     import('./built-in/sec-filings.js'),
     import('./built-in/financial-data.js'),
     import('./built-in/earnings-analysis.js'),
+    import('./built-in/server-shell.js'),
+    import('./built-in/local-exec.js'),
   ]);
 
   const toolKeys = [
@@ -116,6 +118,7 @@ export async function registerBuiltInToolsAsync(): Promise<void> {
     'proposeToolTool', 'proposeWorkflowTool',
     'spawnAgentTool', 'codeForgeTool', 'projectMemoryTool',
     'stockPriceTool', 'secFilingsTool', 'financialDataTool', 'earningsAnalysisTool',
+    'serverShellTool', 'localExecTool',
   ];
 
   for (let i = 0; i < modules.length; i++) {

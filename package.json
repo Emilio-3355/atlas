@@ -12,6 +12,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
     "@hono/node-server": "^1.13.8",
+    "@types/ws": "^8.18.1",
     "brave-search": "^0.6.1",
     "googleapis": "^144.0.0",
     "hono": "^4.7.4",
@@ -23,6 +24,7 @@
     "playwright": "^1.50.1",
     "twilio": "^5.4.4",
     "winston": "^3.17.0",
+    "ws": "^8.19.0",
     "zod": "^3.24.2"
   },
   "devDependencies": {

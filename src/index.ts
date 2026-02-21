@@ -10,6 +10,7 @@ import whatsappRouter from './routes/whatsapp.js';
 import healthRouter from './routes/health.js';
 import gmailCallbackRouter from './routes/gmail-callback.js';
 import logger from './utils/logger.js';
+import { initDaemonBridge, closeDaemonBridge } from './services/daemon-bridge.js';
 
 const app = new Hono();
 
@@ -56,10 +57,16 @@ async function start() {
     logger.info(`Atlas is alive on port ${env.PORT}`, { env: env.NODE_ENV });
   });
 
+  // Initialize daemon bridge (WebSocket server for remote Mac control)
+  if (env.DAEMON_SECRET) {
+    initDaemonBridge(server as any);
+  }
+
   // Graceful shutdown
   const shutdown = async (signal: string) => {
     logger.info(`Received ${signal}, shutting down gracefully...`);
 
+    closeDaemonBridge();
     server.close();
     stopScheduler();
     await closePool();
