@@ -3,6 +3,19 @@ import { generateEmbedding } from '../services/embedding.js';
 import type { MemoryVector } from '../types/index.js';
 import logger from '../utils/logger.js';
 
+// Cosine similarity computed in-app (pgvector not available on Railway standard Postgres)
+function cosineSimilarity(a: number[], b: number[]): number {
+  if (a.length !== b.length || a.length === 0) return 0;
+  let dot = 0, normA = 0, normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  const denom = Math.sqrt(normA) * Math.sqrt(normB);
+  return denom === 0 ? 0 : dot / denom;
+}
+
 export async function storeSemanticMemory(
   content: string,
   source?: string,
@@ -13,9 +26,9 @@ export async function storeSemanticMemory(
 
   const result = await query(
     `INSERT INTO memory_vectors (content, embedding, metadata, source, conversation_id)
-     VALUES ($1, $2::vector, $3, $4, $5)
+     VALUES ($1, $2, $3, $4, $5)
      RETURNING *`,
-    [content, `[${embedding.join(',')}]`, JSON.stringify(metadata), source || null, conversationId || null]
+    [content, JSON.stringify(embedding), JSON.stringify(metadata), source || null, conversationId || null]
   );
 
   return mapRow(result.rows[0]);
@@ -28,16 +41,20 @@ export async function semanticSearch(
 ): Promise<(MemoryVector & { score: number })[]> {
   const embedding = await generateEmbedding(queryText);
 
-  const result = await query(
-    `SELECT *, 1 - (embedding <=> $1::vector) AS score
-     FROM memory_vectors
-     WHERE 1 - (embedding <=> $1::vector) > $2
-     ORDER BY embedding <=> $1::vector
-     LIMIT $3`,
-    [`[${embedding.join(',')}]`, minScore, limit]
-  );
+  // Fetch all vectors and compute similarity in-app
+  const result = await query(`SELECT * FROM memory_vectors`);
 
-  return result.rows.map((row: any) => ({ ...mapRow(row), score: parseFloat(row.score) }));
+  const scored = result.rows
+    .map((row: any) => {
+      const stored = typeof row.embedding === 'string' ? JSON.parse(row.embedding) : (row.embedding || []);
+      const score = cosineSimilarity(embedding, stored);
+      return { ...mapRow(row), score };
+    })
+    .filter((r) => r.score > minScore)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+
+  return scored;
 }
 
 export async function keywordSearch(
@@ -67,38 +84,39 @@ export async function hybridSearch(
 
   const embedding = await generateEmbedding(queryText);
 
-  const result = await query(
-    `WITH semantic AS (
-       SELECT id, content, metadata, source, conversation_id, created_at,
-              1 - (embedding <=> $1::vector) AS sem_score
-       FROM memory_vectors
-     ),
-     keyword AS (
-       SELECT id, similarity(content, $2) AS kw_score
-       FROM memory_vectors
-       WHERE content ILIKE $3 OR similarity(content, $2) > 0.05
-     )
-     SELECT s.id, s.content, s.metadata, s.source, s.conversation_id, s.created_at,
-            COALESCE(s.sem_score, 0) * $4 + COALESCE(k.kw_score, 0) * $5 AS raw_score,
-            (COALESCE(s.sem_score, 0) * $4 + COALESCE(k.kw_score, 0) * $5)
-              * EXP(-LN(2) / $6 * EXTRACT(EPOCH FROM (NOW() - s.created_at)) / 86400) AS score
-     FROM semantic s
-     LEFT JOIN keyword k ON s.id = k.id
-     WHERE COALESCE(s.sem_score, 0) > 0.2 OR COALESCE(k.kw_score, 0) > 0.05
-     ORDER BY score DESC
-     LIMIT $7`,
-    [
-      `[${embedding.join(',')}]`,
-      queryText,
-      `%${queryText}%`,
-      SEMANTIC_WEIGHT,
-      KEYWORD_WEIGHT,
-      DECAY_HALF_LIFE_DAYS,
-      limit,
-    ]
+  // Get keyword matches from DB
+  const kwResult = await query(
+    `SELECT id, similarity(content, $1) AS kw_score
+     FROM memory_vectors
+     WHERE content ILIKE $2 OR similarity(content, $1) > 0.05`,
+    [queryText, `%${queryText}%`]
   );
+  const kwScores = new Map(kwResult.rows.map((r: any) => [r.id, parseFloat(r.kw_score)]));
 
-  return result.rows.map((row: any) => ({ ...mapRow(row), score: parseFloat(row.score) }));
+  // Get all vectors for semantic scoring
+  const allResult = await query(`SELECT * FROM memory_vectors`);
+
+  const now = Date.now();
+  const scored = allResult.rows
+    .map((row: any) => {
+      const stored = typeof row.embedding === 'string' ? JSON.parse(row.embedding) : (row.embedding || []);
+      const semScore = cosineSimilarity(embedding, stored);
+      const kwScore = kwScores.get(row.id) || 0;
+
+      if (semScore < 0.2 && kwScore < 0.05) return null;
+
+      const rawScore = semScore * SEMANTIC_WEIGHT + kwScore * KEYWORD_WEIGHT;
+      const ageDays = (now - new Date(row.created_at).getTime()) / 86400000;
+      const decay = Math.exp(-Math.LN2 / DECAY_HALF_LIFE_DAYS * ageDays);
+      const score = rawScore * decay;
+
+      return { ...mapRow(row), score };
+    })
+    .filter((r): r is NonNullable<typeof r> => r !== null)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+
+  return scored;
 }
 
 function mapRow(row: any): MemoryVector {
