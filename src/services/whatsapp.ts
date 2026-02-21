@@ -12,12 +12,30 @@ function getClient(): twilio.Twilio {
   return twilioClient;
 }
 
+// Channel-agnostic: if TWILIO_WHATSAPP_NUMBER starts with "whatsapp:" → WhatsApp mode.
+// Otherwise → regular SMS/MMS mode.
+function isWhatsAppMode(): boolean {
+  return getEnv().TWILIO_WHATSAPP_NUMBER.startsWith('whatsapp:');
+}
+
+function formatNumber(phone: string): string {
+  if (isWhatsAppMode()) {
+    return phone.startsWith('whatsapp:') ? phone : `whatsapp:${phone}`;
+  }
+  // SMS mode: strip whatsapp: prefix if present
+  return phone.replace(/^whatsapp:/, '');
+}
+
+function getFromNumber(): string {
+  const num = getEnv().TWILIO_WHATSAPP_NUMBER;
+  if (isWhatsAppMode()) return num;
+  // SMS mode: return as-is (plain phone number)
+  return num;
+}
+
 export async function sendWhatsAppMessage(to: string, body: string): Promise<string> {
-  const env = getEnv();
-  const from = env.TWILIO_WHATSAPP_NUMBER.startsWith('whatsapp:')
-    ? env.TWILIO_WHATSAPP_NUMBER
-    : `whatsapp:${env.TWILIO_WHATSAPP_NUMBER}`;
-  const toFormatted = to.startsWith('whatsapp:') ? to : `whatsapp:${to}`;
+  const from = getFromNumber();
+  const toFormatted = formatNumber(to);
 
   try {
     const message = await getClient().messages.create({
@@ -25,20 +43,17 @@ export async function sendWhatsAppMessage(to: string, body: string): Promise<str
       from,
       to: toFormatted,
     });
-    logger.debug('WhatsApp message sent', { sid: message.sid, to: toFormatted });
+    logger.debug('Message sent', { sid: message.sid, to: toFormatted, channel: isWhatsAppMode() ? 'whatsapp' : 'sms' });
     return message.sid;
   } catch (err) {
-    logger.error('Failed to send WhatsApp message', { error: err, to: toFormatted });
+    logger.error('Failed to send message', { error: err, to: toFormatted });
     throw err;
   }
 }
 
 export async function sendWhatsAppImage(to: string, mediaUrl: string, caption?: string): Promise<string> {
-  const env = getEnv();
-  const from = env.TWILIO_WHATSAPP_NUMBER.startsWith('whatsapp:')
-    ? env.TWILIO_WHATSAPP_NUMBER
-    : `whatsapp:${env.TWILIO_WHATSAPP_NUMBER}`;
-  const toFormatted = to.startsWith('whatsapp:') ? to : `whatsapp:${to}`;
+  const from = getFromNumber();
+  const toFormatted = formatNumber(to);
 
   try {
     const message = await getClient().messages.create({
@@ -47,10 +62,10 @@ export async function sendWhatsAppImage(to: string, mediaUrl: string, caption?: 
       mediaUrl: [mediaUrl],
       body: caption || '',
     });
-    logger.debug('WhatsApp image sent', { sid: message.sid, to: toFormatted });
+    logger.debug('Image sent', { sid: message.sid, to: toFormatted, channel: isWhatsAppMode() ? 'whatsapp' : 'sms' });
     return message.sid;
   } catch (err) {
-    logger.error('Failed to send WhatsApp image', { error: err, to: toFormatted });
+    logger.error('Failed to send image', { error: err, to: toFormatted });
     throw err;
   }
 }

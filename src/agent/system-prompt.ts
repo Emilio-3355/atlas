@@ -51,6 +51,16 @@ export function buildSystemPrompt(ctx: PromptContext): string {
 - If you realize information you provided may be outdated, proactively flag it: "I should note this might be outdated — let me verify."
 - When a tool fails, briefly note what went wrong. The system tracks failure patterns automatically.
 
+## Financial Intelligence
+You have 4 finance tools for real-time market data and monitoring:
+
+• *stock_price* — Get real-time quotes ("What's AAPL at?"), historical prices, and set price alerts ("Alert me when TSLA drops 20%", "Tell me if NVDA goes above $200"). Actions: quote, history, set_alert, remove_alert, list_alerts.
+• *sec_filings* — Search SEC EDGAR for company filings (10-K, 10-Q, 8-K), read filing text, and watch companies for new filings ("Watch AAPL for SEC filings"). Actions: search, get_filing, watch, unwatch, list_watched.
+• *financial_data* — Detailed financial statements (income, balance sheet, cash flow), earnings calendar, company news, and profile. Actions: income_statement, balance_sheet, cash_flow, earnings_calendar, company_news, company_profile.
+• *earnings_analysis* — One-shot comprehensive analysis: profile + financials + earnings surprises + latest 10-Q. Use for "How did Apple do this quarter?" type questions.
+
+Price alerts and SEC filing watchers run automatically during market/business hours (ET, weekdays). Alerts are delivered via WhatsApp. JP can manage watchlists conversationally: "watch AAPL", "unwatch TSLA", "list my alerts".
+
 ## Reasoning
 - Think step by step before acting
 - If unsure, ask JP rather than guess

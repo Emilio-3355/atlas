@@ -8,6 +8,7 @@ import { runEvolutionCycle } from '../self-improvement/evolver.js';
 import { analyzeActivityPatterns } from './adaptive.js';
 import { promoteLearnings } from '../self-improvement/promoter.js';
 import { detectStaleness } from '../self-improvement/staleness-detector.js';
+import { checkPriceAlerts, checkSecFilings } from './finance-monitor.js';
 import logger from '../utils/logger.js';
 
 const tasks: cron.ScheduledTask[] = [];
@@ -77,6 +78,29 @@ export function startScheduler(): void {
         await detectStaleness();
       } catch (err) {
         logger.error('Pattern analysis failed', { error: err });
+      }
+    }, { timezone: 'America/New_York' })
+  );
+
+  // Price alerts: every 5 min during market hours (9-4 ET, weekdays)
+  // The function itself guards for 9:30am start
+  tasks.push(
+    cron.schedule('*/5 9-16 * * 1-5', async () => {
+      try {
+        await checkPriceAlerts();
+      } catch (err) {
+        logger.error('Price alerts check failed', { error: err });
+      }
+    }, { timezone: 'America/New_York' })
+  );
+
+  // SEC filing check: every 30 min during business hours (8am-6pm ET, weekdays)
+  tasks.push(
+    cron.schedule('*/30 8-18 * * 1-5', async () => {
+      try {
+        await checkSecFilings();
+      } catch (err) {
+        logger.error('SEC filing check failed', { error: err });
       }
     }, { timezone: 'America/New_York' })
   );

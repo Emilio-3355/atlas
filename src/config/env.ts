@@ -26,6 +26,7 @@ const envSchema = z.object({
   JP_SCHOOL_EMAIL: z.string().default(''),
 
   BRAVE_SEARCH_API_KEY: z.string().default(''),
+  FINNHUB_API_KEY: z.string().default(''),
 
   LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug']).default('info'),
 });
