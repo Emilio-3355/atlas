@@ -9,6 +9,7 @@ import { analyzeActivityPatterns } from './adaptive.js';
 import { promoteLearnings } from '../self-improvement/promoter.js';
 import { detectStaleness } from '../self-improvement/staleness-detector.js';
 import { checkPriceAlerts, checkSecFilings } from './finance-monitor.js';
+import { dashboardBus } from '../services/dashboard-events.js';
 import logger from '../utils/logger.js';
 
 const tasks: cron.ScheduledTask[] = [];
@@ -19,6 +20,7 @@ export function startScheduler(): void {
     cron.schedule('*/30 7-23 * * *', async () => {
       try {
         await runHeartbeat();
+        dashboardBus.publish({ type: 'cron_fired', data: { job: 'Heartbeat' } });
       } catch (err) {
         logger.error('Heartbeat failed', { error: err });
       }
@@ -30,6 +32,7 @@ export function startScheduler(): void {
     cron.schedule('30 7 * * 1-5', async () => {
       try {
         await generateMorningBriefing();
+        dashboardBus.publish({ type: 'cron_fired', data: { job: 'Morning Briefing' } });
       } catch (err) {
         logger.error('Morning briefing failed', { error: err });
       }
@@ -43,6 +46,7 @@ export function startScheduler(): void {
         await executeDueTasks();
       } catch (err) {
         logger.error('Due task check failed', { error: err });
+        dashboardBus.publish({ type: 'error', data: { source: 'cron:due_tasks', message: String(err) } });
       }
     })
   );
@@ -63,6 +67,7 @@ export function startScheduler(): void {
     cron.schedule('0 22 * * *', async () => {
       try {
         await runEvolutionCycle();
+        dashboardBus.publish({ type: 'cron_fired', data: { job: 'Evolution' } });
       } catch (err) {
         logger.error('Evolution cycle failed', { error: err });
       }
@@ -76,6 +81,7 @@ export function startScheduler(): void {
         await analyzeActivityPatterns();
         await promoteLearnings();
         await detectStaleness();
+        dashboardBus.publish({ type: 'cron_fired', data: { job: 'Patterns' } });
       } catch (err) {
         logger.error('Pattern analysis failed', { error: err });
       }
@@ -88,6 +94,7 @@ export function startScheduler(): void {
     cron.schedule('*/5 9-16 * * 1-5', async () => {
       try {
         await checkPriceAlerts();
+        dashboardBus.publish({ type: 'cron_fired', data: { job: 'Price Alerts' } });
       } catch (err) {
         logger.error('Price alerts check failed', { error: err });
       }
@@ -99,6 +106,7 @@ export function startScheduler(): void {
     cron.schedule('*/30 8-18 * * 1-5', async () => {
       try {
         await checkSecFilings();
+        dashboardBus.publish({ type: 'cron_fired', data: { job: 'SEC Filings' } });
       } catch (err) {
         logger.error('SEC filing check failed', { error: err });
       }
@@ -145,6 +153,7 @@ async function executeDueTasks(): Promise<void> {
         );
       }
 
+      dashboardBus.publish({ type: 'task_fired', data: { id: task.id, taskType: task.task_type, content: task.content?.slice(0, 80) } });
       logger.info('Scheduled task executed', { id: task.id, type: task.task_type });
     } catch (err) {
       logger.error('Failed to execute scheduled task', { id: task.id, error: err });

@@ -11,6 +11,8 @@ import healthRouter from './routes/health.js';
 import gmailCallbackRouter from './routes/gmail-callback.js';
 import logger from './utils/logger.js';
 import { initDaemonBridge, closeDaemonBridge } from './services/daemon-bridge.js';
+import dashboardRouter from './routes/dashboard-api.js';
+import { initDashboardWS, closeDashboardWS } from './services/dashboard-ws.js';
 
 const app = new Hono();
 
@@ -21,6 +23,7 @@ app.use('*', requestLogger);
 app.route('/webhook/whatsapp', whatsappRouter);
 app.route('/health', healthRouter);
 app.route('/auth/google/callback', gmailCallbackRouter);
+app.route('/control', dashboardRouter);
 
 // Voice call forwarding — forwards incoming calls to JP's phone
 app.post('/voice/forward', (c) => {
@@ -62,11 +65,15 @@ async function start() {
     initDaemonBridge(server as any);
   }
 
+  // Initialize dashboard WebSocket
+  initDashboardWS(server as any);
+
   // Graceful shutdown
   const shutdown = async (signal: string) => {
     logger.info(`Received ${signal}, shutting down gracefully...`);
 
     closeDaemonBridge();
+    closeDashboardWS();
     server.close();
     stopScheduler();
     await closePool();

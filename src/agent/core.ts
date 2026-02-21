@@ -9,6 +9,7 @@ import { shouldCompact, compactConversation } from '../memory/conversation.js';
 import { detectCorrection, handleCorrection } from '../self-improvement/correction-detector.js';
 import { detectStaleness, handleStalenessFromToolResult } from '../self-improvement/staleness-detector.js';
 import { query } from '../config/database.js';
+import { dashboardBus } from '../services/dashboard-events.js';
 import logger from '../utils/logger.js';
 import type { AgentContext, AgentResponse, ReasoningDepth, ToolContext, PendingAction } from '../types/index.js';
 
@@ -29,6 +30,9 @@ export async function processMessage(phone: string, incomingMessage: string): Pr
 
   // Store incoming message
   await storeMessage(conversation.id, 'user', incomingMessage);
+
+  // Dashboard event: message received
+  dashboardBus.publish({ type: 'message_in', data: { phone, preview: incomingMessage.slice(0, 100), conversationId: conversation.id } });
 
   // Auto-detect corrections and outdated knowledge
   const correctionSignal = detectCorrection(incomingMessage);
@@ -119,12 +123,19 @@ export async function processMessage(phone: string, incomingMessage: string): Pr
     const toolUseBlock = extractToolUse(response.content);
 
     if (toolUseBlock) {
+      // Dashboard event: tool call
+      dashboardBus.publish({ type: 'tool_call', data: { tool: toolUseBlock.name, input: toolUseBlock.input } });
+
+      const toolCallStart = Date.now();
       // Execute tool
       const toolResult = await executeToolCall(
         toolUseBlock.name,
         toolUseBlock.input as Record<string, any>,
         { conversationId: conversation.id, userPhone: phone, language },
       );
+
+      // Dashboard event: tool result
+      dashboardBus.publish({ type: 'tool_result', data: { tool: toolUseBlock.name, success: toolResult.success, durationMs: Date.now() - toolCallStart, error: toolResult.error } });
 
       // Log tool usage
       await logToolUsage(toolUseBlock.name, toolResult.success, Date.now() - startTime, conversation.id, toolResult.error);
@@ -140,6 +151,7 @@ export async function processMessage(phone: string, incomingMessage: string): Pr
 
       // If tool requires approval, handle the approval flow
       if (toolResult.requiresApproval && toolResult.approvalPreview) {
+        dashboardBus.publish({ type: 'approval_created', data: { tool: toolUseBlock.name, preview: toolResult.approvalPreview?.slice(0, 100) } });
         await createPendingAction(
           toolUseBlock.name,
           toolUseBlock.input as Record<string, any>,
@@ -181,6 +193,9 @@ export async function processMessage(phone: string, incomingMessage: string): Pr
     if (textResponse) {
       await respondToUser(phone, textResponse, language);
       await storeMessage(conversation.id, 'assistant', textResponse);
+
+      // Dashboard event: message sent
+      dashboardBus.publish({ type: 'message_out', data: { phone, preview: textResponse.slice(0, 100), conversationId: conversation.id } });
 
       // Update conversation
       await query(

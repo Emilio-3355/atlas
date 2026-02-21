@@ -29,6 +29,7 @@ const envSchema = z.object({
   FINNHUB_API_KEY: z.string().default(''),
 
   DAEMON_SECRET: z.string().min(32).default(''),
+  DASHBOARD_TOKEN: z.string().default(''),
 
   LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug']).default('info'),
 });
