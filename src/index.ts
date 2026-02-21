@@ -21,6 +21,16 @@ app.route('/webhook/whatsapp', whatsappRouter);
 app.route('/health', healthRouter);
 app.route('/auth/google/callback', gmailCallbackRouter);
 
+// Voice call forwarding — forwards incoming calls to JP's phone
+app.post('/voice/forward', (c) => {
+  const jpPhone = getEnv().JP_PHONE_NUMBER;
+  return c.text(
+    `<?xml version="1.0" encoding="UTF-8"?><Response><Dial>${jpPhone}</Dial></Response>`,
+    200,
+    { 'Content-Type': 'text/xml' },
+  );
+});
+
 // Root
 app.get('/', (c) => c.json({ name: 'Atlas', status: 'running', version: '1.0.0' }));
 
