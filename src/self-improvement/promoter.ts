@@ -6,7 +6,7 @@ import logger from '../utils/logger.js';
 const PROMOTION_THRESHOLD = 3; // Pattern must occur 3+ times to be promoted
 
 // Graduate high-value learnings to permanent memory
-export async function promoteLearnigs(): Promise<number> {
+export async function promoteLearnings(): Promise<number> {
   let promoted = 0;
 
   // Find learnings with high pattern counts and resolutions

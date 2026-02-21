@@ -6,7 +6,7 @@ import { runHeartbeat } from './heartbeat.js';
 import { generateMorningBriefing } from './morning-briefing.js';
 import { runEvolutionCycle } from '../self-improvement/evolver.js';
 import { analyzeActivityPatterns } from './adaptive.js';
-import { promoteLearnigs } from '../self-improvement/promoter.js';
+import { promoteLearnings } from '../self-improvement/promoter.js';
 import { detectStaleness } from '../self-improvement/staleness-detector.js';
 import logger from '../utils/logger.js';
 
@@ -73,7 +73,7 @@ export function startScheduler(): void {
     cron.schedule('0 0 * * *', async () => {
       try {
         await analyzeActivityPatterns();
-        await promoteLearnigs();
+        await promoteLearnings();
         await detectStaleness();
       } catch (err) {
         logger.error('Pattern analysis failed', { error: err });

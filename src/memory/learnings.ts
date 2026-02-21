@@ -25,11 +25,11 @@ export async function recordLearning(
   if (existing.rows.length > 0) {
     // Increment pattern count
     const result = await query(
-      `UPDATE learnings SET pattern_count = pattern_count + 1, outcome = $2,
-       reflection = COALESCE($3, reflection), resolution = COALESCE($4, resolution),
-       resolved_at = CASE WHEN $2 = 'success' THEN NOW() ELSE resolved_at END
-       WHERE id = $5 RETURNING *`,
-      [outcome, reflection, resolution, existing.rows[0].id]
+      `UPDATE learnings SET pattern_count = pattern_count + 1, outcome = $1,
+       reflection = COALESCE($2, reflection), resolution = COALESCE($3, resolution),
+       resolved_at = CASE WHEN $1 = 'success' THEN NOW() ELSE resolved_at END
+       WHERE id = $4 RETURNING *`,
+      [outcome, reflection || null, resolution || null, existing.rows[0].id]
     );
     return mapRow(result.rows[0]);
   }

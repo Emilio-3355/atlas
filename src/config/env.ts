@@ -22,6 +22,9 @@ const envSchema = z.object({
   GMAIL_REDIRECT_URI: z.string().default(''),
   GMAIL_REFRESH_TOKEN: z.string().default(''),
 
+  JP_GMAIL: z.string().default(''),
+  JP_SCHOOL_EMAIL: z.string().default(''),
+
   BRAVE_SEARCH_API_KEY: z.string().default(''),
 
   LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug']).default('info'),

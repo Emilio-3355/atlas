@@ -1,17 +1,18 @@
 import { getEnv } from '../config/env.js';
 import logger from '../utils/logger.js';
 
-// Normalize phone numbers for comparison (strip whatsapp: prefix)
-function normalizePhone(phone: string): string {
-  return phone.replace(/^whatsapp:/, '').replace(/\s+/g, '');
+// Extract last 10 digits for comparison.
+// Mexican numbers may arrive as +52XXXXXXXXXX or +521XXXXXXXXXX from Twilio.
+function extractDigits(phone: string): string {
+  return phone.replace(/\D/g, '').slice(-10);
 }
 
 export function isAuthorizedUser(phone: string): boolean {
-  const jpPhone = normalizePhone(getEnv().JP_PHONE_NUMBER);
-  const incoming = normalizePhone(phone);
+  const jpDigits = extractDigits(getEnv().JP_PHONE_NUMBER);
+  const incomingDigits = extractDigits(phone);
 
-  if (incoming === jpPhone) return true;
+  if (incomingDigits === jpDigits) return true;
 
-  logger.warn('Unauthorized access attempt', { phone: incoming });
+  logger.warn('Unauthorized access attempt', { phone });
   return false;
 }
