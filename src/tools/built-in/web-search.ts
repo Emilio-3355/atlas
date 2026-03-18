@@ -1,11 +1,67 @@
 import type { ToolDefinition, ToolResult, ToolContext } from '../../types/index.js';
-import { getEnv } from '../../config/env.js';
 import { tagContent } from '../../security/content-trust.js';
 import logger from '../../utils/logger.js';
 
+interface SearchResult {
+  title: string;
+  url: string;
+  description: string;
+}
+
+async function duckDuckGoSearch(query: string, count: number): Promise<SearchResult[]> {
+  // Use DuckDuckGo HTML search — no API key needed
+  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`DuckDuckGo returned ${response.status}`);
+  }
+
+  const html = await response.text();
+  const results: SearchResult[] = [];
+
+  // Parse results from HTML — each result is in a div.result
+  const resultBlocks = html.split('class="result__body"');
+  for (let i = 1; i < resultBlocks.length && results.length < count; i++) {
+    const block = resultBlocks[i];
+
+    // Extract URL
+    const urlMatch = block.match(/href="([^"]*?)"\s*class="result__url"/);
+    const snippetUrlMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/);
+    const titleMatch = block.match(/class="result__a"[^>]*>([\s\S]*?)<\/a>/);
+    const hrefMatch = block.match(/href="\/\/duckduckgo\.com\/l\/\?uddg=(.*?)&amp;/);
+
+    let resultUrl = '';
+    if (hrefMatch) {
+      resultUrl = decodeURIComponent(hrefMatch[1]);
+    } else if (urlMatch) {
+      resultUrl = urlMatch[1].trim();
+      if (!resultUrl.startsWith('http')) resultUrl = 'https://' + resultUrl;
+    }
+
+    const title = titleMatch
+      ? titleMatch[1].replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#x27;/g, "'").replace(/&quot;/g, '"').trim()
+      : '';
+
+    const description = snippetUrlMatch
+      ? snippetUrlMatch[1].replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#x27;/g, "'").replace(/&quot;/g, '"').trim()
+      : '';
+
+    if (title && resultUrl) {
+      results.push({ title, url: resultUrl, description });
+    }
+  }
+
+  return results;
+}
+
 export const webSearchTool: ToolDefinition = {
   name: 'web_search',
-  description: 'Search the web using Brave Search API. Returns titles, URLs, and snippets for the query. Use for finding current information, restaurants, events, prices, etc.',
+  description: 'Search the web for current information. Returns titles, URLs, and snippets. Use for finding restaurants, events, prices, news, etc.',
   category: 'informational',
   requiresApproval: false,
   inputSchema: {
@@ -23,37 +79,21 @@ export const webSearchTool: ToolDefinition = {
     const count = Math.min(input.count || 5, 10);
 
     try {
-      const response = await fetch(
-        `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(input.query)}&count=${count}`,
-        {
-          headers: {
-            'Accept': 'application/json',
-            'Accept-Encoding': 'gzip',
-            'X-Subscription-Token': getEnv().BRAVE_SEARCH_API_KEY,
-          },
-        }
-      );
+      const results = await duckDuckGoSearch(input.query, count);
 
-      if (!response.ok) {
-        return { success: false, error: `Brave Search returned ${response.status}` };
+      if (results.length === 0) {
+        return { success: true, data: { results: [], formatted: 'No results found.', count: 0 } };
       }
 
-      const data = await response.json() as any;
-      const results = (data.web?.results || []).map((r: any) => ({
-        title: r.title,
-        url: r.url,
-        description: r.description,
-      }));
-
-      // Tag as untrusted external content
-      const formatted = results.map((r: any) =>
-        `• *${r.title}*\n  ${r.url}\n  ${tagContent(r.description, 'untrusted', 'brave_search')}`
+      const formatted = results.map((r) =>
+        `• *${r.title}*\n  ${r.url}\n  ${tagContent(r.description, 'untrusted', 'web_search')}`
       ).join('\n\n');
 
       return { success: true, data: { results, formatted, count: results.length } };
     } catch (err) {
-      logger.error('Web search error', { error: err, query: input.query });
-      return { success: false, error: err instanceof Error ? err.message : 'Search failed' };
+      const errMsg = err instanceof Error ? err.message : String(err);
+      logger.error('Web search error', { error: errMsg, query: input.query });
+      return { success: false, error: errMsg };
     }
   },
 };
