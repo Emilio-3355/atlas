@@ -16,6 +16,11 @@ import { initDaemonBridge, closeDaemonBridge } from './services/daemon-bridge.js
 import dashboardRouter from './routes/dashboard-api.js';
 import { initDashboardWS, closeDashboardWS } from './services/dashboard-ws.js';
 import { isTelegramEnabled, getTelegramBot } from './services/telegram.js';
+import { messageQueue } from './agent/message-queue.js';
+import { processMessage } from './agent/core.js';
+
+// Wire up the message processing handler (central, not hidden in a route file)
+messageQueue.setHandler(processMessage);
 
 const app = new Hono();
 
