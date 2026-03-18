@@ -78,11 +78,13 @@ export async function processMessage(phone: string, incomingMessage: string, cha
     pendingActions,
   };
 
-  // Build messages for Claude
-  const claudeMessages: Anthropic.MessageParam[] = recentMessages.map((m) => ({
-    role: m.role === 'user' ? 'user' as const : 'assistant' as const,
-    content: m.content,
-  }));
+  // Build messages for Claude — sanitize to prevent API errors
+  const claudeMessages: Anthropic.MessageParam[] = sanitizeMessages(
+    recentMessages.map((m) => ({
+      role: m.role === 'user' ? 'user' as const : 'assistant' as const,
+      content: m.content,
+    }))
+  );
 
   // Get available tools
   const registry = getToolRegistry();
@@ -430,4 +432,78 @@ async function logToolUsage(toolName: string, success: boolean, durationMs: numb
   } catch {
     // Non-critical — don't fail the main flow
   }
+}
+
+/**
+ * Sanitize message history to prevent Claude API errors:
+ * 1. Ensure all content is plain text (strip any serialized tool_use blocks)
+ * 2. Merge consecutive same-role messages
+ * 3. Ensure first message is from user
+ * 4. Ensure alternating user/assistant pattern
+ */
+function sanitizeMessages(messages: Anthropic.MessageParam[]): Anthropic.MessageParam[] {
+  if (messages.length === 0) return messages;
+
+  const cleaned: Anthropic.MessageParam[] = [];
+
+  for (const msg of messages) {
+    // Ensure content is a plain string — strip any JSON-encoded content blocks
+    let content: string;
+    if (typeof msg.content === 'string') {
+      content = msg.content;
+    } else if (Array.isArray(msg.content)) {
+      // Extract text from content blocks, skip tool_use/tool_result blocks
+      content = msg.content
+        .filter((b: any) => b.type === 'text')
+        .map((b: any) => b.text || '')
+        .join('');
+      if (!content) continue; // skip messages with no text content
+    } else {
+      continue;
+    }
+
+    // Skip empty messages
+    if (!content.trim()) continue;
+
+    // If content looks like a serialized JSON array of content blocks, extract text
+    if (content.startsWith('[{') && content.includes('"type"')) {
+      try {
+        const parsed = JSON.parse(content);
+        if (Array.isArray(parsed)) {
+          content = parsed
+            .filter((b: any) => b.type === 'text')
+            .map((b: any) => b.text || '')
+            .join('');
+          if (!content.trim()) continue;
+        }
+      } catch {
+        // Not JSON — use as-is
+      }
+    }
+
+    const role = msg.role === 'user' ? 'user' as const : 'assistant' as const;
+
+    // Merge consecutive same-role messages
+    if (cleaned.length > 0 && cleaned[cleaned.length - 1].role === role) {
+      const prev = cleaned[cleaned.length - 1];
+      cleaned[cleaned.length - 1] = {
+        role,
+        content: `${prev.content}\n\n${content}`,
+      };
+    } else {
+      cleaned.push({ role, content });
+    }
+  }
+
+  // Ensure first message is from user
+  while (cleaned.length > 0 && cleaned[0].role !== 'user') {
+    cleaned.shift();
+  }
+
+  // Ensure last message is from user (Claude expects to respond to user)
+  while (cleaned.length > 0 && cleaned[cleaned.length - 1].role !== 'user') {
+    cleaned.pop();
+  }
+
+  return cleaned;
 }
