@@ -50,6 +50,32 @@ healthRouter.get('/', async (c) => {
   );
 });
 
+// Debug: dump conversation messages for the active Telegram conversation
+healthRouter.get('/debug/messages', async (c) => {
+  try {
+    const conv = await query(
+      `SELECT * FROM conversations WHERE user_phone LIKE 'tg:%' AND status = 'active'
+       ORDER BY updated_at DESC LIMIT 1`
+    );
+    if (conv.rows.length === 0) return c.json({ error: 'No active telegram conversation' });
+
+    const convId = conv.rows[0].id;
+    const msgs = await query(
+      `SELECT id, role, LEFT(content, 200) as content_preview, tool_name,
+       LENGTH(content) as content_length, created_at
+       FROM messages WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT 25`,
+      [convId]
+    );
+
+    return c.json({
+      conversation: { id: convId, phone: conv.rows[0].user_phone, messageCount: conv.rows[0].message_count },
+      messages: msgs.rows,
+    });
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // Debug endpoint — shows recent errors and tool count
 healthRouter.get('/debug', async (c) => {
   const registry = getToolRegistry();
