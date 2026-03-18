@@ -28,6 +28,9 @@ const envSchema = z.object({
   BRAVE_SEARCH_API_KEY: z.string().default(''),
   FINNHUB_API_KEY: z.string().default(''),
 
+  TELEGRAM_BOT_TOKEN: z.string().default(''),
+  TELEGRAM_CHAT_ID: z.string().default(''),
+
   DAEMON_SECRET: z.string().default(''),
   DASHBOARD_TOKEN: z.string().default(''),
 

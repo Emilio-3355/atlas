@@ -11,15 +11,15 @@ import { detectStaleness, handleStalenessFromToolResult } from '../self-improvem
 import { query } from '../config/database.js';
 import { dashboardBus } from '../services/dashboard-events.js';
 import logger from '../utils/logger.js';
-import type { AgentContext, AgentResponse, ReasoningDepth, ToolContext, PendingAction } from '../types/index.js';
+import type { AgentContext, AgentResponse, ReasoningDepth, ToolContext, PendingAction, MessageChannel } from '../types/index.js';
 
 const MAX_TOOL_ITERATIONS = 10;
 
-export async function processMessage(phone: string, incomingMessage: string): Promise<void> {
+export async function processMessage(phone: string, incomingMessage: string, channel: MessageChannel = 'whatsapp'): Promise<void> {
   const startTime = Date.now();
 
   // Check for pending approval responses
-  const approvalResult = await checkApprovalResponse(phone, incomingMessage);
+  const approvalResult = await checkApprovalResponse(phone, incomingMessage, channel);
   if (approvalResult) return;
 
   // Detect language
@@ -65,6 +65,7 @@ export async function processMessage(phone: string, incomingMessage: string): Pr
     conversationId: conversation.id,
     userPhone: phone,
     language,
+    channel,
     recentMessages: recentMessages.map((m) => ({
       role: m.role as any,
       content: m.content,
@@ -131,7 +132,7 @@ export async function processMessage(phone: string, incomingMessage: string): Pr
       const toolResult = await executeToolCall(
         toolUseBlock.name,
         toolUseBlock.input as Record<string, any>,
-        { conversationId: conversation.id, userPhone: phone, language },
+        { conversationId: conversation.id, userPhone: phone, language, channel },
       );
 
       // Dashboard event: tool result
@@ -159,7 +160,7 @@ export async function processMessage(phone: string, incomingMessage: string): Pr
           conversation.id,
         );
         // Send approval request to JP
-        await respondToUser(phone, toolResult.approvalPreview, language);
+        await respondToUser(phone, toolResult.approvalPreview, language, channel);
         await storeMessage(conversation.id, 'assistant', toolResult.approvalPreview);
         return;
       }
@@ -191,7 +192,7 @@ export async function processMessage(phone: string, incomingMessage: string): Pr
     const textResponse = extractTextContent(response.content);
 
     if (textResponse) {
-      await respondToUser(phone, textResponse, language);
+      await respondToUser(phone, textResponse, language, channel);
       await storeMessage(conversation.id, 'assistant', textResponse);
 
       // Dashboard event: message sent
@@ -219,7 +220,7 @@ export async function processMessage(phone: string, incomingMessage: string): Pr
   const fallback = language === 'es'
     ? 'Perdón, esta tarea es más compleja de lo esperado. ¿Puedes reformular tu solicitud?'
     : 'Sorry, this task is more complex than expected. Could you rephrase your request?';
-  await respondToUser(phone, fallback, language);
+  await respondToUser(phone, fallback, language, channel);
 }
 
 // ===== Helper Functions =====
@@ -305,7 +306,7 @@ async function getPendingActions(phone: string): Promise<PendingAction[]> {
   }
 }
 
-async function checkApprovalResponse(phone: string, message: string): Promise<boolean> {
+async function checkApprovalResponse(phone: string, message: string, channel: MessageChannel = 'whatsapp'): Promise<boolean> {
   const normalized = message.trim().toLowerCase();
   const isApproval = ['1', 'yes', 'send', 'approve', 'dale', 'sí', 'si', 'ok', 'okay'].includes(normalized);
   const isDenial = ['3', 'no', 'cancel', 'cancelar', 'nah', 'stop'].includes(normalized);
@@ -335,6 +336,7 @@ async function checkApprovalResponse(phone: string, message: string): Promise<bo
         conversationId: action.conversation_id,
         userPhone: phone,
         language: 'en',
+        channel,
       });
 
       await query(
@@ -343,19 +345,19 @@ async function checkApprovalResponse(phone: string, message: string): Promise<bo
       );
 
       const confirmMsg = toolResult.success ? '✓ Done!' : `Failed: ${toolResult.error}`;
-      await respondToUser(phone, confirmMsg);
+      await respondToUser(phone, confirmMsg, undefined, channel);
     }
     return true;
   }
 
   if (isDenial) {
     await query(`UPDATE pending_actions SET status = 'denied', resolved_at = NOW() WHERE id = $1`, [action.id]);
-    await respondToUser(phone, '✗ Cancelled.');
+    await respondToUser(phone, '✗ Cancelled.', undefined, channel);
     return true;
   }
 
   if (isEdit) {
-    await respondToUser(phone, 'What would you like to change? Send me the updated details.');
+    await respondToUser(phone, 'What would you like to change? Send me the updated details.', undefined, channel);
     return true;
   }
 

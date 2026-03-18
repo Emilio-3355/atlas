@@ -15,6 +15,7 @@
     "@types/ws": "^8.18.1",
     "brave-search": "^0.6.1",
     "googleapis": "^144.0.0",
+    "grammy": "^1.41.1",
     "hono": "^4.7.4",
     "ioredis": "^5.4.2",
     "node-cron": "^3.0.3",

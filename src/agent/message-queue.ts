@@ -1,10 +1,12 @@
 import logger from '../utils/logger.js';
+import type { MessageChannel } from '../types/index.js';
 
-type MessageHandler = (phone: string, message: string) => Promise<void>;
+type MessageHandler = (phone: string, message: string, channel: MessageChannel) => Promise<void>;
 
 interface QueueItem {
   phone: string;
   message: string;
+  channel: MessageChannel;
   resolve: () => void;
   reject: (err: Error) => void;
 }
@@ -19,12 +21,12 @@ class MessageQueue {
     this.handler = handler;
   }
 
-  async enqueue(phone: string, message: string): Promise<void> {
+  async enqueue(phone: string, message: string, channel: MessageChannel = 'whatsapp'): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       if (!this.queues.has(phone)) {
         this.queues.set(phone, []);
       }
-      this.queues.get(phone)!.push({ phone, message, resolve, reject });
+      this.queues.get(phone)!.push({ phone, message, channel, resolve, reject });
       this.processQueue(phone);
     });
   }
@@ -43,7 +45,7 @@ class MessageQueue {
       const item = queue.shift()!;
       try {
         if (this.handler) {
-          await this.handler(item.phone, item.message);
+          await this.handler(item.phone, item.message, item.channel);
         }
         item.resolve();
       } catch (err) {

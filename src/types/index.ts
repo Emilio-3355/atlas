@@ -10,7 +10,9 @@ export type ApprovalStatus = 'pending' | 'approved' | 'denied' | 'expired' | 'ex
 
 export type TaskScheduleType = 'one_shot' | 'recurring' | 'interval';
 
-export type TaskDelivery = 'whatsapp' | 'internal' | 'conditional';
+export type TaskDelivery = 'whatsapp' | 'telegram' | 'internal' | 'conditional';
+
+export type MessageChannel = 'whatsapp' | 'telegram';
 
 export type LearningOutcome = 'success' | 'failure' | 'partial';
 
@@ -28,6 +30,7 @@ export interface AgentContext {
   conversationId: string;
   userPhone: string;
   language: string;
+  channel: MessageChannel;
   recentMessages: AgentMessage[];
   relevantMemory: string;
   relevantLearnings: string;
@@ -48,6 +51,7 @@ export interface ToolContext {
   conversationId: string;
   userPhone: string;
   language: string;
+  channel: MessageChannel;
 }
 
 export interface ToolResult {

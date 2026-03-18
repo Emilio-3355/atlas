@@ -30,7 +30,7 @@ export async function executeWorkflow(
     // Send play-by-play status if defined
     if (step.playByPlay) {
       const statusMsg = formatPlayByPlay(step.playByPlay, i + 1, workflow.steps.length);
-      await respondToUser(ctx.userPhone, statusMsg, ctx.language);
+      await respondToUser(ctx.userPhone, statusMsg, ctx.language, ctx.channel);
     }
 
     // Check if step requires approval — pause workflow

@@ -7,12 +7,14 @@ import { requestLogger } from './middleware/request-logger.js';
 import { registerBuiltInToolsAsync } from './tools/registry.js';
 import { startScheduler, stopScheduler } from './scheduler/cron.js';
 import whatsappRouter from './routes/whatsapp.js';
+import telegramRouter from './routes/telegram.js';
 import healthRouter from './routes/health.js';
 import gmailCallbackRouter from './routes/gmail-callback.js';
 import logger from './utils/logger.js';
 import { initDaemonBridge, closeDaemonBridge } from './services/daemon-bridge.js';
 import dashboardRouter from './routes/dashboard-api.js';
 import { initDashboardWS, closeDashboardWS } from './services/dashboard-ws.js';
+import { isTelegramEnabled, getTelegramBot } from './services/telegram.js';
 
 const app = new Hono();
 
@@ -21,6 +23,7 @@ app.use('*', requestLogger);
 
 // Routes
 app.route('/webhook/whatsapp', whatsappRouter);
+app.route('/webhook/telegram', telegramRouter);
 app.route('/health', healthRouter);
 app.route('/auth/google/callback', gmailCallbackRouter);
 app.route('/control', dashboardRouter);
@@ -63,6 +66,20 @@ async function start() {
   // Initialize daemon bridge (WebSocket server for remote Mac control)
   if (env.DAEMON_SECRET) {
     initDaemonBridge(server as any);
+  }
+
+  // Initialize Telegram webhook (if token provided)
+  if (isTelegramEnabled()) {
+    try {
+      const webhookUrl = `${env.BASE_URL}/webhook/telegram`;
+      const bot = getTelegramBot();
+      if (bot) {
+        await bot.api.setWebhook(webhookUrl);
+        logger.info('Telegram webhook set', { url: webhookUrl });
+      }
+    } catch (err) {
+      logger.warn('Failed to set Telegram webhook (non-fatal)', { error: err });
+    }
   }
 
   // Initialize dashboard WebSocket

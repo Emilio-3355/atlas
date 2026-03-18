@@ -8,6 +8,9 @@ function extractDigits(phone: string): string {
 }
 
 export function isAuthorizedUser(phone: string): boolean {
+  // Telegram users are authorized via chat ID in the route layer
+  if (phone.startsWith('tg:')) return true;
+
   const jpDigits = extractDigits(getEnv().JP_PHONE_NUMBER);
   const incomingDigits = extractDigits(phone);
 
