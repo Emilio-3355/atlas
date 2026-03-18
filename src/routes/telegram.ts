@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { getAuthorizedChatId, transcribeVoiceMessage, sendTelegramMessage } from '../services/telegram.js';
 import { messageQueue } from '../agent/message-queue.js';
 import { rateLimiter } from '../security/rate-limiter.js';
+import { recordError } from './health.js';
 import logger from '../utils/logger.js';
 
 const telegramRouter = new Hono();
@@ -61,7 +62,9 @@ telegramRouter.post('/', async (c) => {
     const userIdentifier = `tg:${chatId}`;
 
     messageQueue.enqueue(userIdentifier, text, 'telegram').catch((err) => {
-      logger.error('Telegram message queue error', { error: err instanceof Error ? err.message : String(err), chatId });
+      const errMsg = err instanceof Error ? err.message : String(err);
+      logger.error('Telegram message queue error', { error: errMsg, chatId });
+      recordError(err);
       // Send error notification so messages don't silently disappear
       sendTelegramMessage(chatId, '⚠️ Error processing your message. Please try again.').catch(() => {});
     });
