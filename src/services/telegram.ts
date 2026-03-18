@@ -1,4 +1,4 @@
-import { Bot } from 'grammy';
+import { Bot, InputFile } from 'grammy';
 import OpenAI from 'openai';
 import { getEnv } from '../config/env.js';
 import logger from '../utils/logger.js';
@@ -90,6 +90,22 @@ export async function transcribeVoiceMessage(fileId: string): Promise<string> {
 
   logger.info('Voice message transcribed', { fileId, length: transcription.text.length });
   return transcription.text;
+}
+
+/** Send a voice message (audio buffer) to a Telegram chat */
+export async function sendTelegramVoice(chatId: string | number, audioBuffer: Buffer): Promise<number> {
+  const b = getTelegramBot();
+  if (!b) throw new Error('Telegram bot not initialized');
+
+  try {
+    const inputFile = new InputFile(audioBuffer, 'voice.mp3');
+    const msg = await b.api.sendVoice(chatId, inputFile);
+    logger.debug('Telegram voice sent', { chatId, messageId: msg.message_id });
+    return msg.message_id;
+  } catch (err) {
+    logger.error('Failed to send Telegram voice', { error: err, chatId });
+    throw err;
+  }
 }
 
 /** Convert WhatsApp-style formatting to Telegram HTML */

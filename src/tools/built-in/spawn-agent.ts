@@ -57,12 +57,17 @@ export const spawnAgentTool: ToolDefinition = {
       },
       mode: {
         type: 'string',
-        enum: ['build', 'fix', 'review', 'test', 'explore'],
+        enum: ['build', 'fix', 'review', 'test', 'explore', 'atlas_sub'],
         description: 'Agent mode: build (new features), fix (bugs), review (code review), test (run tests), explore (understand codebase)',
       },
       timeout: {
         type: 'number',
         description: 'Max execution time in seconds (default 300, max 600)',
+      },
+      parallel_tasks: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'For atlas_sub mode: list of tasks to run in parallel (max 3)',
       },
     },
     required: ['project', 'task'],
@@ -77,11 +82,47 @@ export const spawnAgentTool: ToolDefinition = {
   },
 
   async execute(
-    input: { project: string; task: string; mode?: string; timeout?: number },
+    input: { project: string; task: string; mode?: string; timeout?: number; parallel_tasks?: string[] },
     ctx: ToolContext,
   ): Promise<ToolResult> {
     const mode = input.mode || 'build';
     const timeout = Math.min(input.timeout || 300, 600) * 1000;
+
+    // Atlas sub-agent mode: runs as a lightweight internal agent
+    if (mode === 'atlas_sub') {
+      const { runSubAgent, runParallelSubAgents } = await import('../../agent/sub-agent.js');
+
+      // Parallel mode
+      if (input.parallel_tasks && input.parallel_tasks.length > 1) {
+        const tasks = input.parallel_tasks.map((t: string) => ({ task: t, depth: 'fast' as const }));
+        const results = await runParallelSubAgents(tasks, ctx);
+        return {
+          success: results.every(r => r.success),
+          data: {
+            results: results.map((r, i) => ({
+              task: input.parallel_tasks![i],
+              output: r.output,
+              toolsUsed: r.toolsUsed,
+              success: r.success,
+            })),
+            mode: 'atlas_sub_parallel',
+          },
+        };
+      }
+
+      // Single sub-agent
+      const result = await runSubAgent({ task: input.task, depth: 'fast' }, ctx);
+      return {
+        success: result.success,
+        data: {
+          output: result.output,
+          toolsUsed: result.toolsUsed,
+          iterations: result.iterations,
+          durationMs: result.durationMs,
+          mode: 'atlas_sub',
+        },
+      };
+    }
 
     // Resolve project path
     let projectPath = input.project;

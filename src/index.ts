@@ -8,6 +8,7 @@ import { registerBuiltInToolsAsync } from './tools/registry.js';
 import { startScheduler, stopScheduler } from './scheduler/cron.js';
 import whatsappRouter from './routes/whatsapp.js';
 import telegramRouter from './routes/telegram.js';
+import slackRouter from './routes/slack.js';
 import healthRouter from './routes/health.js';
 import gmailCallbackRouter from './routes/gmail-callback.js';
 import logger from './utils/logger.js';
@@ -24,6 +25,7 @@ app.use('*', requestLogger);
 // Routes
 app.route('/webhook/whatsapp', whatsappRouter);
 app.route('/webhook/telegram', telegramRouter);
+app.route('/webhook/slack', slackRouter);
 app.route('/health', healthRouter);
 app.route('/auth/google/callback', gmailCallbackRouter);
 app.route('/control', dashboardRouter);
@@ -36,6 +38,26 @@ app.post('/voice/forward', (c) => {
     200,
     { 'Content-Type': 'text/xml' },
   );
+});
+
+// Serve voice files temporarily (for Twilio media)
+app.get('/media/voice/:filename', async (c) => {
+  const filename = c.req.param('filename');
+  // Security: only allow alphanumeric + underscore + .mp3
+  if (!/^[a-zA-Z0-9_]+\.mp3$/.test(filename)) {
+    return c.text('Not found', 404);
+  }
+  const filePath = `/tmp/atlas-voice/${filename}`;
+  try {
+    const fs = await import('fs');
+    if (!fs.existsSync(filePath)) return c.text('Not found', 404);
+    const buffer = fs.readFileSync(filePath);
+    return new Response(buffer, {
+      headers: { 'Content-Type': 'audio/mpeg', 'Content-Length': String(buffer.length) },
+    });
+  } catch {
+    return c.text('Not found', 404);
+  }
 });
 
 // Root
@@ -54,6 +76,10 @@ async function start() {
 
   // Register tools
   await registerBuiltInToolsAsync();
+
+  // Load dynamically-forged tools from database
+  const { loadDynamicTools } = await import('./tools/registry.js');
+  await loadDynamicTools();
 
   // Start scheduler
   startScheduler();

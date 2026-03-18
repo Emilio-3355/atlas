@@ -8,6 +8,7 @@ import { getToolRegistry } from '../tools/registry.js';
 import { shouldCompact, compactConversation } from '../memory/conversation.js';
 import { detectCorrection, handleCorrection } from '../self-improvement/correction-detector.js';
 import { detectStaleness, handleStalenessFromToolResult } from '../self-improvement/staleness-detector.js';
+import { recordToolChain } from '../self-improvement/foundry.js';
 import { query } from '../config/database.js';
 import { dashboardBus } from '../services/dashboard-events.js';
 import logger from '../utils/logger.js';
@@ -109,6 +110,7 @@ export async function processMessage(phone: string, incomingMessage: string, cha
   let currentDepth: ReasoningDepth = depth;
   let iterations = 0;
   let currentMessages = [...claudeMessages];
+  const toolsUsed: string[] = [];
 
   while (iterations < MAX_TOOL_ITERATIONS) {
     iterations++;
@@ -126,6 +128,7 @@ export async function processMessage(phone: string, incomingMessage: string, cha
     if (toolUseBlock) {
       // Dashboard event: tool call
       dashboardBus.publish({ type: 'tool_call', data: { tool: toolUseBlock.name, input: toolUseBlock.input } });
+      toolsUsed.push(toolUseBlock.name);
 
       const toolCallStart = Date.now();
       // Execute tool
@@ -211,6 +214,17 @@ export async function processMessage(phone: string, incomingMessage: string, cha
         durationMs: Date.now() - startTime,
         tokensUsed: response.usage.inputTokens + response.usage.outputTokens,
       });
+
+      // Foundry: record multi-tool chains for crystallization analysis
+      if (toolsUsed.length >= 2) {
+        recordToolChain(
+          toolsUsed,
+          incomingMessage.slice(0, 200),
+          textResponse.slice(0, 200),
+          true,
+          conversation.id,
+        ).catch((err) => logger.debug('Foundry recording skipped', { error: err }));
+      }
     }
 
     return;

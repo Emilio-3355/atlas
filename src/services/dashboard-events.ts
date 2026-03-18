@@ -9,7 +9,11 @@ export interface DashboardEvent {
     | 'cron_fired'
     | 'task_fired'
     | 'approval_created'
-    | 'error';
+    | 'foundry_proposals'
+    | 'error'
+    | 'heartbeat'
+    | 'sub_agent_start'
+    | 'sub_agent_done';
   ts: number;
   data: Record<string, any>;
 }

@@ -14,6 +14,10 @@ export async function respondToUser(
   if (channel === 'telegram') {
     const chatId = phone.replace(/^tg:/, '');
     await sendTelegramMessage(chatId, text);
+  } else if (channel === 'slack') {
+    // For Slack, the response is sent back through the Slack API
+    const { sendSlackMessage } = await import('../services/slack.js');
+    await sendSlackMessage(phone.replace(/^slack:/, ''), text);
   } else {
     const chunks = formatForWhatsApp(text);
     for (const chunk of chunks) {
@@ -36,6 +40,9 @@ export async function sendImage(
   if (channel === 'telegram') {
     const chatId = phone.replace(/^tg:/, '');
     await sendTelegramImage(chatId, imageUrl, caption);
+  } else if (channel === 'slack') {
+    const { sendSlackImage } = await import('../services/slack.js');
+    await sendSlackImage(phone.replace(/^slack:/, ''), imageUrl, caption);
   } else {
     await sendWhatsAppImage(phone, imageUrl, caption);
   }

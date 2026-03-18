@@ -37,6 +37,11 @@ class ToolRegistry {
     const tool = this.tools.get(name);
     if (tool) tool.enabled = true;
   }
+
+  // Count all registered tools
+  count(): number {
+    return this.tools.size;
+  }
 }
 
 let registry: ToolRegistry | null = null;
@@ -126,5 +131,72 @@ export async function registerBuiltInToolsAsync(): Promise<void> {
     if (tool) reg.register(tool);
   }
 
+  // Register browser network tools (multiple exports from one module)
+  try {
+    const browserNetMod = await import('./built-in/browser-network.js');
+    if (browserNetMod.browserNetworkTool) reg.register(browserNetMod.browserNetworkTool);
+    if (browserNetMod.browserNetworkInterceptTool) reg.register(browserNetMod.browserNetworkInterceptTool);
+    if (browserNetMod.browserNetworkClearTool) reg.register(browserNetMod.browserNetworkClearTool);
+  } catch (err) {
+    logger.warn('Failed to load browser network tools', { error: err });
+  }
+
+  // Register voice reply tool
+  try {
+    const voiceMod = await import('./built-in/voice-reply.js');
+    if (voiceMod.voiceReplyTool) reg.register(voiceMod.voiceReplyTool);
+  } catch (err) {
+    logger.warn('Failed to load voice reply tool', { error: err });
+  }
+
+  // Register filesystem tool
+  try {
+    const fsMod = await import('./built-in/filesystem.js');
+    if (fsMod.filesystemTool) reg.register(fsMod.filesystemTool);
+  } catch (err) {
+    logger.warn('Failed to load filesystem tool', { error: err });
+  }
+
   logger.info(`Registered ${reg.getAll().length} built-in tools`);
+}
+
+/**
+ * Load dynamically-generated tools from the database (code_forge output).
+ * Called at startup to restore tools that were forged in previous sessions.
+ */
+export async function loadDynamicTools(): Promise<void> {
+  try {
+    const { query } = await import('../config/database.js');
+    const result = await query(
+      `SELECT name, implementation FROM tool_definitions WHERE status = 'active' AND implementation_type = 'generated_code'`
+    );
+
+    const reg = getToolRegistry();
+    let loaded = 0;
+
+    for (const row of result.rows) {
+      try {
+        const impl = typeof row.implementation === 'string' ? JSON.parse(row.implementation) : row.implementation;
+        const code = impl.code;
+        if (!code) continue;
+
+        const dataUrl = `data:text/javascript;base64,${Buffer.from(code).toString('base64')}`;
+        const module = await import(dataUrl);
+        const tool = module.tool;
+
+        if (tool && tool.name && typeof tool.execute === 'function') {
+          reg.register(tool);
+          loaded++;
+        }
+      } catch (err) {
+        logger.warn(`Failed to load dynamic tool: ${row.name}`, { error: err });
+      }
+    }
+
+    if (loaded > 0) {
+      logger.info(`Loaded ${loaded} dynamic tools from database`);
+    }
+  } catch (err) {
+    logger.warn('Could not load dynamic tools (DB may not be ready)', { error: err });
+  }
 }

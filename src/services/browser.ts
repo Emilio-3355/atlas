@@ -75,3 +75,138 @@ export async function closeBrowser(): Promise<void> {
     logger.info('Browser closed');
   }
 }
+
+// ===== Network Monitoring =====
+
+interface NetworkEntry {
+  url: string;
+  method: string;
+  status: number;
+  requestHeaders: Record<string, string>;
+  responseHeaders: Record<string, string>;
+  resourceType: string;
+  timestamp: number;
+  duration: number;
+}
+
+const networkLogs = new Map<string, NetworkEntry[]>();
+const MAX_LOG_ENTRIES = 500;
+
+/**
+ * Create a page with network monitoring enabled.
+ * All requests/responses are captured in the network log.
+ */
+export async function createMonitoredPage(profileId: string = 'default'): Promise<Page> {
+  const page = await createPage();
+
+  if (!networkLogs.has(profileId)) {
+    networkLogs.set(profileId, []);
+  }
+  const log = networkLogs.get(profileId)!;
+
+  const pendingRequests = new Map<string, { url: string; method: string; headers: Record<string, string>; resourceType: string; startTime: number }>();
+
+  page.on('request', (request) => {
+    pendingRequests.set(request.url() + request.method(), {
+      url: request.url(),
+      method: request.method(),
+      headers: request.headers(),
+      resourceType: request.resourceType(),
+      startTime: Date.now(),
+    });
+  });
+
+  page.on('response', async (response) => {
+    const key = response.url() + response.request().method();
+    const pending = pendingRequests.get(key);
+    if (!pending) return;
+    pendingRequests.delete(key);
+
+    const entry: NetworkEntry = {
+      url: pending.url,
+      method: pending.method,
+      status: response.status(),
+      requestHeaders: pending.headers,
+      responseHeaders: response.headers(),
+      resourceType: pending.resourceType,
+      timestamp: pending.startTime,
+      duration: Date.now() - pending.startTime,
+    };
+
+    log.push(entry);
+
+    // Cap at MAX_LOG_ENTRIES
+    if (log.length > MAX_LOG_ENTRIES) {
+      log.splice(0, log.length - MAX_LOG_ENTRIES);
+    }
+  });
+
+  return page;
+}
+
+/**
+ * Get captured network requests, optionally filtered.
+ */
+export function getNetworkLog(
+  profileId: string = 'default',
+  filter?: { urlPattern?: string; method?: string; statusMin?: number; statusMax?: number },
+): NetworkEntry[] {
+  const log = networkLogs.get(profileId) || [];
+
+  if (!filter) return [...log];
+
+  return log.filter((entry) => {
+    if (filter.urlPattern && !new RegExp(filter.urlPattern, 'i').test(entry.url)) return false;
+    if (filter.method && entry.method.toUpperCase() !== filter.method.toUpperCase()) return false;
+    if (filter.statusMin && entry.status < filter.statusMin) return false;
+    if (filter.statusMax && entry.status > filter.statusMax) return false;
+    return true;
+  });
+}
+
+/**
+ * Clear the network log for a profile.
+ */
+export function clearNetworkLog(profileId: string = 'default'): void {
+  networkLogs.set(profileId, []);
+}
+
+/**
+ * Set up request interception on a page.
+ * Actions: 'block' (abort request), 'modify-headers' (add/change headers), 'mock' (return fake response).
+ */
+export async function interceptRequests(
+  page: Page,
+  rules: Array<{
+    urlPattern: string;
+    action: 'block' | 'modify-headers' | 'mock';
+    headers?: Record<string, string>;
+    mockStatus?: number;
+    mockBody?: string;
+    mockContentType?: string;
+  }>,
+): Promise<void> {
+  for (const rule of rules) {
+    await page.route(new RegExp(rule.urlPattern, 'i'), async (route) => {
+      switch (rule.action) {
+        case 'block':
+          await route.abort();
+          break;
+        case 'modify-headers':
+          await route.continue({
+            headers: { ...route.request().headers(), ...(rule.headers || {}) },
+          });
+          break;
+        case 'mock':
+          await route.fulfill({
+            status: rule.mockStatus || 200,
+            contentType: rule.mockContentType || 'application/json',
+            body: rule.mockBody || '{}',
+          });
+          break;
+        default:
+          await route.continue();
+      }
+    });
+  }
+}

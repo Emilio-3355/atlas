@@ -34,6 +34,10 @@ const envSchema = z.object({
   DAEMON_SECRET: z.string().default(''),
   DASHBOARD_TOKEN: z.string().default(''),
 
+  SLACK_BOT_TOKEN: z.string().default(''),
+  SLACK_SIGNING_SECRET: z.string().default(''),
+  SLACK_APP_TOKEN: z.string().default(''),
+
   LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug']).default('info'),
 });
 
