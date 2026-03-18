@@ -77,3 +77,7 @@ export function extractTextContent(content: Anthropic.ContentBlock[]): string {
 export function extractToolUse(content: Anthropic.ContentBlock[]): Anthropic.ToolUseBlock | null {
   return (content.find((block) => block.type === 'tool_use') as Anthropic.ToolUseBlock) || null;
 }
+
+export function extractAllToolUse(content: Anthropic.ContentBlock[]): Anthropic.ToolUseBlock[] {
+  return content.filter((block): block is Anthropic.ToolUseBlock => block.type === 'tool_use');
+}

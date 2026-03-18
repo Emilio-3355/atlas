@@ -1,5 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
-import { callClaude, extractTextContent, extractToolUse } from './claude-client.js';
+import { callClaude, extractTextContent, extractToolUse, extractAllToolUse } from './claude-client.js';
 import { buildSystemPrompt } from './system-prompt.js';
 import { determineDepth, escalateDepth } from './reasoner.js';
 import { detectMessageLanguage, respondToUser } from './responder.js';
@@ -124,64 +124,60 @@ export async function processMessage(phone: string, incomingMessage: string, cha
       depth: currentDepth,
     });
 
-    // Check for tool use
-    const toolUseBlock = extractToolUse(response.content);
+    // Check for tool use — handle ALL tool_use blocks in the response
+    const allToolUseBlocks = extractAllToolUse(response.content);
 
-    if (toolUseBlock) {
-      // Dashboard event: tool call
-      dashboardBus.publish({ type: 'tool_call', data: { tool: toolUseBlock.name, input: toolUseBlock.input } });
-      toolsUsed.push(toolUseBlock.name);
+    if (allToolUseBlocks.length > 0) {
+      // Execute all tool calls and collect results
+      const toolResults: Array<{ id: string; result: any }> = [];
 
-      const toolCallStart = Date.now();
-      // Execute tool
-      const toolResult = await executeToolCall(
-        toolUseBlock.name,
-        toolUseBlock.input as Record<string, any>,
-        { conversationId: conversation.id, userPhone: phone, language, channel },
-      );
+      for (const toolUseBlock of allToolUseBlocks) {
+        dashboardBus.publish({ type: 'tool_call', data: { tool: toolUseBlock.name, input: toolUseBlock.input } });
+        toolsUsed.push(toolUseBlock.name);
 
-      // Dashboard event: tool result
-      dashboardBus.publish({ type: 'tool_result', data: { tool: toolUseBlock.name, success: toolResult.success, durationMs: Date.now() - toolCallStart, error: toolResult.error } });
-
-      // Log tool usage
-      await logToolUsage(toolUseBlock.name, toolResult.success, Date.now() - startTime, conversation.id, toolResult.error);
-
-      // Staleness detection: check if tool results contradict previous knowledge
-      if (toolResult.success && toolResult.data) {
-        await handleStalenessFromToolResult(
-          toolUseBlock.name,
-          toolResult.data,
-          conversation.id,
-        ).catch((err) => logger.debug('Staleness check skipped', { error: err }));
-      }
-
-      // If tool requires approval, handle the approval flow
-      if (toolResult.requiresApproval && toolResult.approvalPreview) {
-        dashboardBus.publish({ type: 'approval_created', data: { tool: toolUseBlock.name, preview: toolResult.approvalPreview?.slice(0, 100) } });
-        await createPendingAction(
+        const toolCallStart = Date.now();
+        const toolResult = await executeToolCall(
           toolUseBlock.name,
           toolUseBlock.input as Record<string, any>,
-          toolResult.approvalPreview,
-          conversation.id,
+          { conversationId: conversation.id, userPhone: phone, language, channel },
         );
-        // Send approval request to JP
-        await respondToUser(phone, toolResult.approvalPreview, language, channel);
-        await storeMessage(conversation.id, 'assistant', toolResult.approvalPreview);
-        return;
+
+        dashboardBus.publish({ type: 'tool_result', data: { tool: toolUseBlock.name, success: toolResult.success, durationMs: Date.now() - toolCallStart, error: toolResult.error } });
+        await logToolUsage(toolUseBlock.name, toolResult.success, Date.now() - startTime, conversation.id, toolResult.error);
+
+        // Staleness detection
+        if (toolResult.success && toolResult.data) {
+          await handleStalenessFromToolResult(toolUseBlock.name, toolResult.data, conversation.id)
+            .catch((err) => logger.debug('Staleness check skipped', { error: err }));
+        }
+
+        // If tool requires approval, handle it and return
+        if (toolResult.requiresApproval && toolResult.approvalPreview) {
+          dashboardBus.publish({ type: 'approval_created', data: { tool: toolUseBlock.name, preview: toolResult.approvalPreview?.slice(0, 100) } });
+          await createPendingAction(toolUseBlock.name, toolUseBlock.input as Record<string, any>, toolResult.approvalPreview, conversation.id);
+          await respondToUser(phone, toolResult.approvalPreview, language, channel);
+          await storeMessage(conversation.id, 'assistant', toolResult.approvalPreview);
+          return;
+        }
+
+        toolResults.push({
+          id: toolUseBlock.id,
+          result: toolResult,
+        });
       }
 
-      // Add tool use and result to conversation for next iteration
+      // Add assistant response (with all tool_use blocks) and ALL tool_results
       currentMessages.push({
         role: 'assistant',
         content: response.content,
       });
       currentMessages.push({
         role: 'user',
-        content: [{
-          type: 'tool_result',
-          tool_use_id: toolUseBlock.id,
-          content: JSON.stringify(toolResult.data || toolResult.error || 'Done'),
-        }],
+        content: toolResults.map((tr) => ({
+          type: 'tool_result' as const,
+          tool_use_id: tr.id,
+          content: JSON.stringify(tr.result.data || tr.result.error || 'Done'),
+        })),
       });
 
       // Auto-escalate if tool chain is getting long
