@@ -1,4 +1,5 @@
 import { Bot } from 'grammy';
+import OpenAI from 'openai';
 import { getEnv } from '../config/env.js';
 import logger from '../utils/logger.js';
 
@@ -56,6 +57,39 @@ export async function sendTelegramImage(chatId: string | number, imageUrl: strin
     logger.error('Failed to send Telegram image', { error: err, chatId });
     throw err;
   }
+}
+
+/** Download a Telegram voice/audio file and transcribe it via OpenAI Whisper */
+export async function transcribeVoiceMessage(fileId: string): Promise<string> {
+  const b = getTelegramBot();
+  if (!b) throw new Error('Telegram bot not initialized');
+
+  // Get file path from Telegram
+  const file = await b.api.getFile(fileId);
+  const filePath = file.file_path;
+  if (!filePath) throw new Error('Telegram file path not available');
+
+  // Download the voice file
+  const token = getEnv().TELEGRAM_BOT_TOKEN;
+  const fileUrl = `https://api.telegram.org/file/bot${token}/${filePath}`;
+  const response = await fetch(fileUrl);
+  if (!response.ok) throw new Error(`Failed to download voice file: ${response.status}`);
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+
+  // Determine file extension from path (ogg for voice, mp3/mp4 for audio)
+  const ext = filePath.split('.').pop() || 'ogg';
+  const filename = `voice.${ext}`;
+
+  // Transcribe with OpenAI Whisper
+  const openai = new OpenAI({ apiKey: getEnv().OPENAI_API_KEY });
+  const transcription = await openai.audio.transcriptions.create({
+    file: new File([buffer], filename, { type: `audio/${ext}` }),
+    model: 'whisper-1',
+  });
+
+  logger.info('Voice message transcribed', { fileId, length: transcription.text.length });
+  return transcription.text;
 }
 
 /** Convert WhatsApp-style formatting to Telegram HTML */
