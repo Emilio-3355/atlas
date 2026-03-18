@@ -47,8 +47,9 @@ export const browseTool: ToolDefinition = {
         },
       };
     } catch (err) {
-      logger.error('Browse error', { error: err, url: input.url });
-      return { success: false, error: err instanceof Error ? err.message : 'Failed to load page' };
+      const errMsg = err instanceof Error ? err.message : String(err);
+      logger.error('Browse error', { error: errMsg, url: input.url });
+      return { success: false, error: errMsg };
     }
   },
 };
