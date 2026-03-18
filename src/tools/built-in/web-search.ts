@@ -1,5 +1,7 @@
 import type { ToolDefinition, ToolResult, ToolContext } from '../../types/index.js';
+import { getEnv } from '../../config/env.js';
 import { tagContent } from '../../security/content-trust.js';
+import { loadPage } from '../../services/browser.js';
 import logger from '../../utils/logger.js';
 
 interface SearchResult {
@@ -8,54 +10,75 @@ interface SearchResult {
   description: string;
 }
 
-async function duckDuckGoSearch(query: string, count: number): Promise<SearchResult[]> {
-  // Use DuckDuckGo HTML search — no API key needed
-  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-  const response = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-    },
-  });
+/** Search via Brave API (if key available) */
+async function braveSearch(query: string, count: number): Promise<SearchResult[]> {
+  const key = getEnv().BRAVE_SEARCH_API_KEY;
+  if (!key || key === 'PLACEHOLDER') return [];
 
-  if (!response.ok) {
-    throw new Error(`DuckDuckGo returned ${response.status}`);
-  }
-
-  const html = await response.text();
-  const results: SearchResult[] = [];
-
-  // Parse results from HTML — each result is in a div.result
-  const resultBlocks = html.split('class="result__body"');
-  for (let i = 1; i < resultBlocks.length && results.length < count; i++) {
-    const block = resultBlocks[i];
-
-    // Extract URL
-    const urlMatch = block.match(/href="([^"]*?)"\s*class="result__url"/);
-    const snippetUrlMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/);
-    const titleMatch = block.match(/class="result__a"[^>]*>([\s\S]*?)<\/a>/);
-    const hrefMatch = block.match(/href="\/\/duckduckgo\.com\/l\/\?uddg=(.*?)&amp;/);
-
-    let resultUrl = '';
-    if (hrefMatch) {
-      resultUrl = decodeURIComponent(hrefMatch[1]);
-    } else if (urlMatch) {
-      resultUrl = urlMatch[1].trim();
-      if (!resultUrl.startsWith('http')) resultUrl = 'https://' + resultUrl;
+  const response = await fetch(
+    `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${count}`,
+    {
+      headers: {
+        'Accept': 'application/json',
+        'Accept-Encoding': 'gzip',
+        'X-Subscription-Token': key,
+      },
     }
+  );
 
-    const title = titleMatch
-      ? titleMatch[1].replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#x27;/g, "'").replace(/&quot;/g, '"').trim()
-      : '';
+  if (!response.ok) return [];
 
-    const description = snippetUrlMatch
-      ? snippetUrlMatch[1].replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#x27;/g, "'").replace(/&quot;/g, '"').trim()
-      : '';
+  const data = await response.json() as any;
+  return (data.web?.results || []).map((r: any) => ({
+    title: r.title,
+    url: r.url,
+    description: r.description,
+  }));
+}
 
-    if (title && resultUrl) {
-      results.push({ title, url: resultUrl, description });
-    }
-  }
+/** Fallback: search via Google using Playwright headless browser */
+async function browserSearch(query: string, count: number): Promise<SearchResult[]> {
+  const url = `https://www.google.com/search?q=${encodeURIComponent(query)}&num=${count}&hl=en`;
 
+  const { page, content } = await loadPage(url, 2000);
+
+  // Extract structured results from the page (runs in browser context)
+  const results = await page.evaluate(`
+    (() => {
+      const items = [];
+      const links = document.querySelectorAll('a[href^="http"]:not([href*="google"])');
+      const seen = new Set();
+      for (const link of links) {
+        if (items.length >= ${count}) break;
+        const href = link.getAttribute('href') || '';
+        if (!href || seen.has(href)) continue;
+        if (href.includes('google.com') || href.includes('youtube.com/results') || href.includes('accounts.google')) continue;
+        const heading = link.querySelector('h3');
+        if (!heading) continue;
+        const title = (heading.textContent || '').trim();
+        if (!title) continue;
+        seen.add(href);
+        const parent = link.closest('[class]');
+        const grandparent = parent ? parent.parentElement : null;
+        const container = grandparent ? grandparent.parentElement : null;
+        let description = '';
+        if (container) {
+          const spans = container.querySelectorAll('span, div');
+          for (const span of spans) {
+            const text = (span.textContent || '').trim();
+            if (text.length > 50 && text !== title && !text.includes(href)) {
+              description = text.slice(0, 200);
+              break;
+            }
+          }
+        }
+        items.push({ title, url: href, description });
+      }
+      return items;
+    })()
+  `) as SearchResult[];
+
+  await page.close();
   return results;
 }
 
@@ -79,7 +102,14 @@ export const webSearchTool: ToolDefinition = {
     const count = Math.min(input.count || 5, 10);
 
     try {
-      const results = await duckDuckGoSearch(input.query, count);
+      // Try Brave first (if key available)
+      let results = await braveSearch(input.query, count);
+
+      // Fallback to browser-based Google search
+      if (results.length === 0) {
+        logger.info('Brave unavailable, falling back to browser search', { query: input.query });
+        results = await browserSearch(input.query, count);
+      }
 
       if (results.length === 0) {
         return { success: true, data: { results: [], formatted: 'No results found.', count: 0 } };
