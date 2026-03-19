@@ -166,7 +166,7 @@ export async function getCompanyFinancials(
   statement: 'ic' | 'bs' | 'cf' = 'ic',
   freq: 'annual' | 'quarterly' = 'quarterly'
 ): Promise<{ data: FinnhubFinancialReport[] }> {
-  return finnhubFetch('/stock/financials/reported', {
+  return finnhubFetch('/stock/financials-reported', {
     symbol: ticker.toUpperCase(),
     statement,
     freq,
