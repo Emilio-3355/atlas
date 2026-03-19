@@ -266,8 +266,12 @@ export const financialDataTool: ToolDefinition = {
           return { success: false, error: `Unknown action: ${input.action}` };
       }
     } catch (err) {
-      logger.error('Financial data tool error', { error: err, action: input.action, ticker: input.ticker });
-      return { success: false, error: err instanceof Error ? err.message : 'Financial data operation failed' };
+      const errMsg = err instanceof Error ? err.message : 'Financial data operation failed';
+      logger.error('Financial data tool error', { error: errMsg, action: input.action, ticker: input.ticker });
+      if (errMsg.includes('not configured') || errMsg.includes('API key')) {
+        return { success: false, error: `FINNHUB_API_KEY is not configured. Cannot fetch financial data. DO NOT guess — tell JP the API key needs to be added.` };
+      }
+      return { success: false, error: `Financial data failed: ${errMsg}. Try web_search as fallback.` };
     }
   },
 };

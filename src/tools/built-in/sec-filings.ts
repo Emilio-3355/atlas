@@ -159,8 +159,12 @@ export const secFilingsTool: ToolDefinition = {
           return { success: false, error: `Unknown action: ${input.action}. Use: search, get_filing, watch, unwatch, list_watched` };
       }
     } catch (err) {
-      logger.error('SEC filings tool error', { error: err, action: input.action, ticker: input.ticker });
-      return { success: false, error: err instanceof Error ? err.message : 'SEC filings operation failed' };
+      const errMsg = err instanceof Error ? err.message : 'SEC filings operation failed';
+      logger.error('SEC filings tool error', { error: errMsg, action: input.action, ticker: input.ticker });
+      if (errMsg.includes('not configured') || errMsg.includes('API key')) {
+        return { success: false, error: `FINNHUB_API_KEY is not configured. Cannot fetch SEC data. Tell JP the API key needs to be added.` };
+      }
+      return { success: false, error: `SEC filings failed: ${errMsg}` };
     }
   },
 };

@@ -160,8 +160,12 @@ export const earningsAnalysisTool: ToolDefinition = {
         },
       };
     } catch (err) {
-      logger.error('Earnings analysis error', { error: err, ticker });
-      return { success: false, error: err instanceof Error ? err.message : 'Earnings analysis failed' };
+      const errMsg = err instanceof Error ? err.message : 'Earnings analysis failed';
+      logger.error('Earnings analysis error', { error: errMsg, ticker });
+      if (errMsg.includes('not configured') || errMsg.includes('API key')) {
+        return { success: false, error: `FINNHUB_API_KEY is not configured. Cannot analyze earnings. Tell JP the API key needs to be added.` };
+      }
+      return { success: false, error: `Earnings analysis failed: ${errMsg}. Try web_search as fallback.` };
     }
   },
 };

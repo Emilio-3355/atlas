@@ -202,8 +202,15 @@ export const stockPriceTool: ToolDefinition = {
           return { success: false, error: `Unknown action: ${input.action}. Use: quote, history, set_alert, remove_alert, list_alerts` };
       }
     } catch (err) {
-      logger.error('Stock price tool error', { error: err, action: input.action, ticker: input.ticker });
-      return { success: false, error: err instanceof Error ? err.message : 'Stock price operation failed' };
+      const errMsg = err instanceof Error ? err.message : 'Stock price operation failed';
+      logger.error('Stock price tool error', { error: errMsg, action: input.action, ticker: input.ticker });
+
+      // If API key is missing, give clear instructions
+      if (errMsg.includes('not configured') || errMsg.includes('API key')) {
+        return { success: false, error: `FINNHUB_API_KEY is not configured on the server. Cannot fetch real stock data. DO NOT guess prices from memory — tell JP that the finance API key needs to be added to Railway.` };
+      }
+
+      return { success: false, error: `Stock price tool failed: ${errMsg}. Try again or use web_search as fallback to find current prices.` };
     }
   },
 };
