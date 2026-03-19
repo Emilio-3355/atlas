@@ -13,13 +13,13 @@ import { query } from '../config/database.js';
 import { dashboardBus } from '../services/dashboard-events.js';
 import logger from '../utils/logger.js';
 import { hookManager } from '../hooks/manager.js';
-import type { AgentContext, AgentResponse, ReasoningDepth, ToolContext, PendingAction, MessageChannel } from '../types/index.js';
+import type { AgentContext, AgentResponse, ReasoningDepth, ToolContext, PendingAction, MessageChannel, ImageAttachment } from '../types/index.js';
 
 const MAX_TOOL_ITERATIONS = 10;
 
-export async function processMessage(phone: string, incomingMessage: string, channel: MessageChannel = 'whatsapp'): Promise<void> {
+export async function processMessage(phone: string, incomingMessage: string, channel: MessageChannel = 'whatsapp', images?: ImageAttachment[]): Promise<void> {
   try {
-    await _processMessageInner(phone, incomingMessage, channel);
+    await _processMessageInner(phone, incomingMessage, channel, images);
   } catch (err) {
     logger.error('Unhandled error in processMessage', { error: err, phone, channel });
     // Always send a fallback so the user isn't left hanging
@@ -32,7 +32,7 @@ export async function processMessage(phone: string, incomingMessage: string, cha
   }
 }
 
-async function _processMessageInner(phone: string, incomingMessage: string, channel: MessageChannel): Promise<void> {
+async function _processMessageInner(phone: string, incomingMessage: string, channel: MessageChannel, images?: ImageAttachment[]): Promise<void> {
   const startTime = Date.now();
 
   // Check for pending approval responses
@@ -102,6 +102,39 @@ async function _processMessageInner(phone: string, incomingMessage: string, chan
       content: m.content,
     }))
   );
+
+  // If images are attached, replace the last user message with multimodal content
+  if (images && images.length > 0 && claudeMessages.length > 0) {
+    const lastMsg = claudeMessages[claudeMessages.length - 1];
+    if (lastMsg.role === 'user') {
+      const textContent = typeof lastMsg.content === 'string' ? lastMsg.content : '';
+      const contentBlocks: Anthropic.ContentBlockParam[] = [];
+
+      // Add images first so Claude "sees" them before reading the text
+      for (const img of images) {
+        contentBlocks.push({
+          type: 'image',
+          source: {
+            type: 'base64',
+            media_type: img.mediaType,
+            data: img.base64,
+          },
+        });
+      }
+
+      // Then add the text
+      if (textContent.trim()) {
+        contentBlocks.push({ type: 'text', text: textContent });
+      }
+
+      claudeMessages[claudeMessages.length - 1] = {
+        role: 'user',
+        content: contentBlocks,
+      };
+
+      logger.info('Multimodal message constructed', { imageCount: images.length, textLength: textContent.length });
+    }
+  }
 
   // Get available tools
   const registry = getToolRegistry();

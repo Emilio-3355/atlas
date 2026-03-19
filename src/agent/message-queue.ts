@@ -1,12 +1,13 @@
 import logger from '../utils/logger.js';
-import type { MessageChannel } from '../types/index.js';
+import type { MessageChannel, ImageAttachment } from '../types/index.js';
 
-type MessageHandler = (phone: string, message: string, channel: MessageChannel) => Promise<void>;
+type MessageHandler = (phone: string, message: string, channel: MessageChannel, images?: ImageAttachment[]) => Promise<void>;
 
 interface QueueItem {
   phone: string;
   message: string;
   channel: MessageChannel;
+  images?: ImageAttachment[];
   resolve: () => void;
   reject: (err: Error) => void;
 }
@@ -21,12 +22,12 @@ class MessageQueue {
     this.handler = handler;
   }
 
-  async enqueue(phone: string, message: string, channel: MessageChannel = 'whatsapp'): Promise<void> {
+  async enqueue(phone: string, message: string, channel: MessageChannel = 'whatsapp', images?: ImageAttachment[]): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       if (!this.queues.has(phone)) {
         this.queues.set(phone, []);
       }
-      this.queues.get(phone)!.push({ phone, message, channel, resolve, reject });
+      this.queues.get(phone)!.push({ phone, message, channel, images, resolve, reject });
       this.processQueue(phone);
     });
   }
@@ -45,7 +46,7 @@ class MessageQueue {
       const item = queue.shift()!;
       try {
         if (this.handler) {
-          await this.handler(item.phone, item.message, item.channel);
+          await this.handler(item.phone, item.message, item.channel, item.images);
         }
         item.resolve();
       } catch (err) {

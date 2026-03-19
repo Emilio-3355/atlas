@@ -14,6 +14,13 @@ export type TaskDelivery = 'whatsapp' | 'telegram' | 'internal' | 'conditional';
 
 export type MessageChannel = 'whatsapp' | 'telegram' | 'slack';
 
+export interface ImageAttachment {
+  /** Base64-encoded image data */
+  base64: string;
+  /** MIME type (image/jpeg, image/png, image/gif, image/webp) */
+  mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+}
+
 export type LearningOutcome = 'success' | 'failure' | 'partial';
 
 // ===== Agent Types =====
