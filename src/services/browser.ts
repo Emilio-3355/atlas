@@ -1,10 +1,40 @@
-import { chromium, type Browser, type Page } from 'playwright';
+import { chromium, type Browser, type Page, type BrowserContext } from 'playwright';
 import logger from '../utils/logger.js';
 
 let browser: Browser | null = null;
+let consecutiveFailures = 0;
+const MAX_CONSECUTIVE_FAILURES = 5;
+const PAGE_TIMEOUT = 45_000;      // 45s for page navigation
+const SCREENSHOT_TIMEOUT = 30_000; // 30s for screenshots
+
+// ─── Browser Lifecycle ──────────────────────────────────────────
 
 export async function getBrowser(): Promise<Browser> {
-  if (!browser || !browser.isConnected()) {
+  // If browser exists and is connected, reuse it
+  if (browser) {
+    try {
+      if (browser.isConnected()) {
+        return browser;
+      }
+    } catch {
+      // isConnected() itself threw — browser is dead
+    }
+    // Browser is disconnected — clean up
+    logger.warn('Browser disconnected, relaunching');
+    try { await browser.close(); } catch {}
+    browser = null;
+  }
+
+  // Circuit breaker: if we've failed too many times, wait before retrying
+  if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+    const msg = `Browser circuit breaker open: ${consecutiveFailures} consecutive launch failures. Resetting.`;
+    logger.error(msg);
+    consecutiveFailures = 0; // Reset so next attempt tries fresh
+    // Small delay to avoid rapid-fire relaunches
+    await new Promise(r => setTimeout(r, 2000));
+  }
+
+  try {
     browser = await chromium.launch({
       headless: true,
       args: [
@@ -12,21 +42,78 @@ export async function getBrowser(): Promise<Browser> {
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-gpu',
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--single-process',         // More stable in containers
       ],
     });
+
+    // Auto-recover on unexpected disconnect
+    browser.on('disconnected', () => {
+      logger.warn('Browser disconnected unexpectedly');
+      browser = null;
+    });
+
+    consecutiveFailures = 0;
     logger.info('Playwright browser launched');
+    return browser;
+  } catch (err) {
+    consecutiveFailures++;
+    browser = null;
+    logger.error('Failed to launch browser', { error: err, failures: consecutiveFailures });
+    throw new Error(`Browser launch failed (attempt ${consecutiveFailures}): ${err instanceof Error ? err.message : String(err)}`);
   }
-  return browser;
 }
 
 export async function createPage(): Promise<Page> {
   const b = await getBrowser();
-  const context = await b.newContext({
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-    viewport: { width: 1280, height: 800 },
-  });
-  return context.newPage();
+
+  let context: BrowserContext;
+  try {
+    context = await b.newContext({
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      viewport: { width: 1280, height: 800 },
+    });
+  } catch (err) {
+    // Context creation failed — browser is likely dead
+    logger.error('Failed to create browser context, killing browser', { error: err });
+    await killBrowser();
+    // Retry once with a fresh browser
+    const fresh = await getBrowser();
+    context = await fresh.newContext({
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      viewport: { width: 1280, height: 800 },
+    });
+  }
+
+  const page = await context.newPage();
+
+  // Default navigation timeout for all goto calls on this page
+  page.setDefaultNavigationTimeout(PAGE_TIMEOUT);
+  page.setDefaultTimeout(PAGE_TIMEOUT);
+
+  return page;
 }
+
+/** Safely close a page and its context, ignoring errors */
+export async function safeClosePage(page: Page | null): Promise<void> {
+  if (!page) return;
+  try {
+    const ctx = page.context();
+    await page.close().catch(() => {});
+    await ctx.close().catch(() => {});
+  } catch {}
+}
+
+/** Force-kill the browser and reset state */
+async function killBrowser(): Promise<void> {
+  if (browser) {
+    try { await browser.close(); } catch {}
+    browser = null;
+  }
+}
+
+// ─── Page Loading ───────────────────────────────────────────────
 
 export interface PageLink {
   text: string;
@@ -44,21 +131,21 @@ export async function loadPage(url: string, waitMs: number = 3000): Promise<Load
   const page = await createPage();
 
   try {
-    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    const response = await page.goto(url, {
+      waitUntil: 'domcontentloaded',
+      timeout: PAGE_TIMEOUT,
+    });
     const status = response?.status() ?? 0;
     await page.waitForTimeout(waitMs);
 
-    // Extract readable text AND links (runs in browser context)
     const extracted = await page.evaluate(`
       (() => {
-        // Extract links BEFORE removing nav/footer (they contain useful navigation links)
         const links = [];
         const seen = new Set();
         document.querySelectorAll('a[href]').forEach(a => {
           const href = a.getAttribute('href') || '';
           const text = (a.textContent || '').trim().slice(0, 100);
           if (!href || !text || text.length < 2) return;
-          // Resolve relative URLs
           let fullUrl;
           try { fullUrl = new URL(href, document.location.href).href; } catch { return; }
           if (seen.has(fullUrl)) return;
@@ -67,7 +154,6 @@ export async function loadPage(url: string, waitMs: number = 3000): Promise<Load
           links.push({ text, url: fullUrl });
         });
 
-        // Now strip non-content elements for text extraction
         const removeSelectors = ['script', 'style', 'nav', 'footer', 'header', 'iframe', 'noscript'];
         for (const sel of removeSelectors) {
           document.querySelectorAll(sel).forEach(el => el.remove());
@@ -80,7 +166,7 @@ export async function loadPage(url: string, waitMs: number = 3000): Promise<Load
 
     return { page, content: extracted.content, links: extracted.links, status };
   } catch (err) {
-    await page.close();
+    await safeClosePage(page);
     throw err;
   }
 }
@@ -89,24 +175,24 @@ export async function takeScreenshot(url: string): Promise<Buffer> {
   const page = await createPage();
 
   try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    await page.goto(url, {
+      waitUntil: 'domcontentloaded',
+      timeout: SCREENSHOT_TIMEOUT,
+    });
     await page.waitForTimeout(2000);
     const screenshot = await page.screenshot({ type: 'png', fullPage: false });
     return screenshot;
   } finally {
-    await page.close();
+    await safeClosePage(page);
   }
 }
 
 export async function closeBrowser(): Promise<void> {
-  if (browser) {
-    await browser.close();
-    browser = null;
-    logger.info('Browser closed');
-  }
+  await killBrowser();
+  logger.info('Browser closed');
 }
 
-// ===== Network Monitoring =====
+// ─── Network Monitoring ─────────────────────────────────────────
 
 interface NetworkEntry {
   url: string;
@@ -122,10 +208,6 @@ interface NetworkEntry {
 const networkLogs = new Map<string, NetworkEntry[]>();
 const MAX_LOG_ENTRIES = 500;
 
-/**
- * Create a page with network monitoring enabled.
- * All requests/responses are captured in the network log.
- */
 export async function createMonitoredPage(profileId: string = 'default'): Promise<Page> {
   const page = await createPage();
 
@@ -164,8 +246,6 @@ export async function createMonitoredPage(profileId: string = 'default'): Promis
     };
 
     log.push(entry);
-
-    // Cap at MAX_LOG_ENTRIES
     if (log.length > MAX_LOG_ENTRIES) {
       log.splice(0, log.length - MAX_LOG_ENTRIES);
     }
@@ -174,15 +254,11 @@ export async function createMonitoredPage(profileId: string = 'default'): Promis
   return page;
 }
 
-/**
- * Get captured network requests, optionally filtered.
- */
 export function getNetworkLog(
   profileId: string = 'default',
   filter?: { urlPattern?: string; method?: string; statusMin?: number; statusMax?: number },
 ): NetworkEntry[] {
   const log = networkLogs.get(profileId) || [];
-
   if (!filter) return [...log];
 
   return log.filter((entry) => {
@@ -194,17 +270,10 @@ export function getNetworkLog(
   });
 }
 
-/**
- * Clear the network log for a profile.
- */
 export function clearNetworkLog(profileId: string = 'default'): void {
   networkLogs.set(profileId, []);
 }
 
-/**
- * Set up request interception on a page.
- * Actions: 'block' (abort request), 'modify-headers' (add/change headers), 'mock' (return fake response).
- */
 export async function interceptRequests(
   page: Page,
   rules: Array<{

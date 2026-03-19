@@ -1,5 +1,5 @@
 import type { ToolDefinition, ToolResult, ToolContext } from '../../types/index.js';
-import { createPage } from '../../services/browser.js';
+import { createPage, safeClosePage } from '../../services/browser.js';
 import { query } from '../../config/database.js';
 import { tagContent } from '../../security/content-trust.js';
 import logger from '../../utils/logger.js';
@@ -308,8 +308,8 @@ export const siteLoginTool: ToolDefinition = {
         try {
           // Navigate to login page
           logger.info('site_login: navigating', { site: siteId, url: loginUrl });
-          await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-          await page.waitForTimeout(1500);
+          await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+          await page.waitForTimeout(2000);
 
           // Auto-detect and fill the login form
           const fillResult = await autoFillLoginForm(page, creds.username, creds.password);
@@ -317,7 +317,7 @@ export const siteLoginTool: ToolDefinition = {
           if (!fillResult.filled) {
             // Take screenshot for debugging
             const screenshotBuf = await page.screenshot({ type: 'png' }).catch(() => null);
-            await page.close();
+            await safeClosePage(page);
             return {
               success: false,
               error: `Could not find login form on ${loginUrl}. ${fillResult.error || 'No username/password fields detected.'}`,
@@ -339,7 +339,7 @@ export const siteLoginTool: ToolDefinition = {
             pageText.toLowerCase().includes('incorrect username');
 
           if (loginFailed) {
-            await page.close();
+            await safeClosePage(page);
             return { success: false, error: 'Login failed — wrong credentials.' };
           }
 
@@ -398,7 +398,7 @@ export const siteLoginTool: ToolDefinition = {
             }
 
             if (!approved) {
-              await page.close();
+              await safeClosePage(page);
               return { success: false, error: 'MFA timeout (65s). Approve the push on your phone and try again.' };
             }
           }
@@ -406,7 +406,7 @@ export const siteLoginTool: ToolDefinition = {
           // Navigate to target if specified
           const targetUrl = input.target_url || knownSite?.postLoginUrl;
           if (targetUrl && !currentUrl.includes(new URL(targetUrl).hostname)) {
-            await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+            await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
             await page.waitForTimeout(2000);
           }
 
@@ -437,7 +437,7 @@ export const siteLoginTool: ToolDefinition = {
           `) as Array<{ text: string; url: string }>;
 
           const finalUrl = page.url();
-          await page.close();
+          await safeClosePage(page);
 
           return {
             success: true,
@@ -451,7 +451,7 @@ export const siteLoginTool: ToolDefinition = {
             },
           };
         } catch (err) {
-          await page.close().catch(() => {});
+          await safeClosePage(page);
           throw err;
         }
       }

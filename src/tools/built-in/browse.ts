@@ -1,5 +1,5 @@
 import type { ToolDefinition, ToolResult, ToolContext } from '../../types/index.js';
-import { loadPage } from '../../services/browser.js';
+import { loadPage, safeClosePage } from '../../services/browser.js';
 import { tagContent, detectInjection } from '../../security/content-trust.js';
 import logger from '../../utils/logger.js';
 
@@ -22,7 +22,7 @@ export const browseTool: ToolDefinition = {
   async execute(input: { url: string; waitMs?: number }, ctx: ToolContext): Promise<ToolResult> {
     try {
       const { page, content, links, status } = await loadPage(input.url, input.waitMs);
-      await page.close();
+      await safeClosePage(page);
 
       // Report non-200 status
       if (status >= 400) {

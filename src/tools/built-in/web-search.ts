@@ -1,7 +1,7 @@
 import type { ToolDefinition, ToolResult, ToolContext } from '../../types/index.js';
 import { getEnv } from '../../config/env.js';
 import { tagContent } from '../../security/content-trust.js';
-import { loadPage } from '../../services/browser.js';
+import { loadPage, safeClosePage } from '../../services/browser.js';
 import logger from '../../utils/logger.js';
 
 interface SearchResult {
@@ -46,7 +46,7 @@ async function browserSearch(searchQuery: string, count: number): Promise<Search
   // Detect CAPTCHA / blocking
   const isCaptcha = content.includes('unusual traffic') || content.includes('reCAPTCHA') || content.includes('not a robot');
   if (isCaptcha) {
-    await page.close();
+    await safeClosePage(page);
     logger.warn('Google CAPTCHA detected', { query: searchQuery });
     return [];
   }
@@ -87,7 +87,7 @@ async function browserSearch(searchQuery: string, count: number): Promise<Search
     })()
   `) as SearchResult[];
 
-  await page.close();
+  await safeClosePage(page);
   return results;
 }
 

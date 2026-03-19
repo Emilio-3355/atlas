@@ -1,5 +1,5 @@
 import type { ToolDefinition, ToolResult, ToolContext } from '../../types/index.js';
-import { createPage } from '../../services/browser.js';
+import { createPage, safeClosePage } from '../../services/browser.js';
 import logger from '../../utils/logger.js';
 
 export const fillFormTool: ToolDefinition = {
@@ -97,7 +97,7 @@ export const fillFormTool: ToolDefinition = {
       logger.error('Fill form error', { error: err, url: input.url });
       return { success: false, error: err instanceof Error ? err.message : 'Form fill failed' };
     } finally {
-      await page.close();
+      await safeClosePage(page);
     }
   },
 };

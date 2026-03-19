@@ -18,12 +18,12 @@ describe('MessageQueue', () => {
 
   it('enqueue adds message to queue and processes it', async () => {
     await messageQueue.enqueue('+1234', 'hello', 'whatsapp');
-    expect(handler).toHaveBeenCalledWith('+1234', 'hello', 'whatsapp');
+    expect(handler).toHaveBeenCalledWith('+1234', 'hello', 'whatsapp', undefined);
   });
 
   it('passes channel parameter through to handler', async () => {
     await messageQueue.enqueue('tg:123', 'hi', 'telegram');
-    expect(handler).toHaveBeenCalledWith('tg:123', 'hi', 'telegram');
+    expect(handler).toHaveBeenCalledWith('tg:123', 'hi', 'telegram', undefined);
   });
 
   it('serializes messages for same phone', async () => {

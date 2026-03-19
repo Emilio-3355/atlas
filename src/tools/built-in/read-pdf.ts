@@ -1,5 +1,5 @@
 import type { ToolDefinition, ToolResult, ToolContext } from '../../types/index.js';
-import { loadPage } from '../../services/browser.js';
+import { loadPage, safeClosePage } from '../../services/browser.js';
 import { tagContent, detectInjection } from '../../security/content-trust.js';
 import logger from '../../utils/logger.js';
 
@@ -22,7 +22,7 @@ export const readPdfTool: ToolDefinition = {
     try {
       // Use browser to load PDF viewer and extract text
       const { page, content } = await loadPage(input.url, 5000);
-      await page.close();
+      await safeClosePage(page);
 
       if (!content || content.length < 50) {
         // Fallback: try fetching raw PDF and extracting what we can
