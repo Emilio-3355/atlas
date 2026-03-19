@@ -202,27 +202,81 @@ export const siteLoginTool: ToolDefinition = {
           await page.click(config.submitSelector);
           await page.waitForTimeout(config.waitAfterSubmit || 3000);
 
-          // Check if login succeeded
-          const currentUrl = page.url();
-          const loginSucceeded = currentUrl.includes(config.successIndicator);
+          // Check initial result — might be error, MFA, or success
+          let currentUrl = page.url();
+          let pageText = await page.evaluate(
+            '(document.body?.innerText || "").slice(0, 3000)'
+          ) as string;
 
-          if (!loginSucceeded) {
-            // Check for error messages on page
-            const pageText = await page.evaluate(
-              '(document.body?.innerText || "").slice(0, 2000)'
-            ) as string;
+          // Check for wrong credentials
+          const hasLoginError = pageText.toLowerCase().includes('login incorrect') ||
+            pageText.toLowerCase().includes('invalid credentials') ||
+            pageText.toLowerCase().includes('authentication failed');
+
+          if (hasLoginError) {
             await page.close();
-
-            const hasError = pageText.toLowerCase().includes('invalid') ||
-              pageText.toLowerCase().includes('incorrect') ||
-              pageText.toLowerCase().includes('failed') ||
-              pageText.toLowerCase().includes('error');
-
             return {
               success: false,
-              error: hasError
-                ? 'Login failed — credentials may be incorrect. Ask JP to verify.'
-                : `Login may have failed. Current URL: ${currentUrl}. Page might need MFA or additional steps.`,
+              error: 'Login failed — credentials are incorrect. Ask JP to provide the correct ones.',
+            };
+          }
+
+          // Check for Duo MFA — Columbia uses Duo after valid username/password
+          const isDuoPage = currentUrl.includes('duosecurity.com') ||
+            currentUrl.includes('duo.com') ||
+            pageText.toLowerCase().includes('duo') ||
+            pageText.toLowerCase().includes('two-factor') ||
+            pageText.toLowerCase().includes('push notification') ||
+            pageText.toLowerCase().includes('send me a push');
+
+          if (isDuoPage && !currentUrl.includes(config.successIndicator)) {
+            // Try to auto-send Duo push if button is available
+            try {
+              const pushButton = await page.$('button:has-text("Send Me a Push"), button:has-text("Send Push"), #trust-browser-button, .push-label');
+              if (pushButton) {
+                await pushButton.click();
+                logger.info('Duo push sent automatically');
+              }
+            } catch {
+              // Push button not found — that's ok
+            }
+
+            // Wait up to 60 seconds for MFA approval
+            logger.info('Waiting for Duo MFA approval...');
+            let mfaApproved = false;
+            for (let i = 0; i < 20; i++) {
+              await page.waitForTimeout(3000);
+              currentUrl = page.url();
+              if (currentUrl.includes(config.successIndicator)) {
+                mfaApproved = true;
+                break;
+              }
+              // Check if we got redirected past Duo
+              if (!currentUrl.includes('duo') && !currentUrl.includes('cas.columbia.edu')) {
+                mfaApproved = true;
+                break;
+              }
+            }
+
+            if (!mfaApproved) {
+              await page.close();
+              return {
+                success: false,
+                error: 'MFA timeout — Duo push was sent but not approved within 60 seconds. Check your Duo app and try again.',
+              };
+            }
+          }
+
+          // Final check — are we logged in?
+          currentUrl = page.url();
+          const loginSucceeded = currentUrl.includes(config.successIndicator) ||
+            (!currentUrl.includes('cas.columbia.edu') && !currentUrl.includes('duo'));
+
+          if (!loginSucceeded) {
+            await page.close();
+            return {
+              success: false,
+              error: `Login may have failed. Ended up at: ${currentUrl}`,
             };
           }
 
