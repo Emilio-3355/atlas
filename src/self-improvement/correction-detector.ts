@@ -70,8 +70,9 @@ export interface CorrectionSignal {
 export function detectCorrection(userMessage: string): CorrectionSignal | null {
   const trimmed = userMessage.trim();
 
-  // Ignore very short messages (likely just "no" as denial, not correction)
-  if (trimmed.length < 8) return null;
+  // Ignore very short messages (3 chars or less — like "no", "ok")
+  // But allow messages like "wrong" (5 chars), "that's wrong" (12 chars)
+  if (trimmed.length < 4) return null;
 
   // Check staleness FIRST to avoid misclassifying staleness as correction
   // (many staleness phrases like "that's outdated" also match correction patterns)

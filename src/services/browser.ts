@@ -1,16 +1,82 @@
 import { chromium, type Browser, type Page, type BrowserContext } from 'playwright';
+import { writeFile, readFile, mkdir } from 'fs/promises';
+import { existsSync } from 'fs';
+import path from 'path';
 import logger from '../utils/logger.js';
 
 let browser: Browser | null = null;
 let consecutiveFailures = 0;
 let activePages = 0;
+let browserLock: Promise<Browser> | null = null; // Prevent concurrent launches
 
-// Persistent cookie storage — survives across page sessions
+// Persistent cookie storage — survives across page sessions AND process restarts
 let storedCookies: Map<string, any[]> = new Map();
+const COOKIE_DIR = process.env.COOKIE_DIR || '/tmp/atlas-cookies';
 const MAX_CONSECUTIVE_FAILURES = 5;
 const MAX_CONCURRENT_PAGES = 3;   // Prevent OOM from too many pages
-const PAGE_TIMEOUT = 45_000;      // 45s for page navigation
+const PAGE_TIMEOUT = 90_000;      // 90s for page navigation (Duo MFA needs 66s+)
+const MFA_PAGE_TIMEOUT = 120_000; // 2min for pages that will go through MFA
 const SCREENSHOT_TIMEOUT = 30_000; // 30s for screenshots
+
+// ─── Cookie Persistence (to disk) ────────────────────────────────
+
+async function ensureCookieDir(): Promise<void> {
+  if (!existsSync(COOKIE_DIR)) {
+    await mkdir(COOKIE_DIR, { recursive: true });
+  }
+}
+
+async function persistCookiesToDisk(domain: string, cookies: any[]): Promise<void> {
+  try {
+    await ensureCookieDir();
+    const filePath = path.join(COOKIE_DIR, `${domain}.json`);
+    await writeFile(filePath, JSON.stringify(cookies, null, 2));
+    logger.debug('Cookies persisted to disk', { domain, count: cookies.length });
+  } catch (err) {
+    logger.debug('Failed to persist cookies to disk', { error: err });
+  }
+}
+
+async function loadCookiesFromDisk(domain: string): Promise<any[] | null> {
+  try {
+    const filePath = path.join(COOKIE_DIR, `${domain}.json`);
+    if (!existsSync(filePath)) return null;
+    const data = await readFile(filePath, 'utf-8');
+    const cookies = JSON.parse(data);
+    if (Array.isArray(cookies) && cookies.length > 0) {
+      logger.debug('Cookies loaded from disk', { domain, count: cookies.length });
+      return cookies;
+    }
+    return null;
+  } catch (err) {
+    logger.debug('Failed to load cookies from disk', { error: err });
+    return null;
+  }
+}
+
+// Load cookies from disk on startup
+async function initCookies(): Promise<void> {
+  try {
+    await ensureCookieDir();
+    const { readdirSync } = await import('fs');
+    const files = readdirSync(COOKIE_DIR).filter(f => f.endsWith('.json'));
+    for (const file of files) {
+      const domain = file.replace('.json', '');
+      const cookies = await loadCookiesFromDisk(domain);
+      if (cookies) {
+        storedCookies.set(domain, cookies);
+      }
+    }
+    if (storedCookies.size > 0) {
+      logger.info('Restored cookies from disk', { domains: Array.from(storedCookies.keys()) });
+    }
+  } catch (err) {
+    logger.debug('Cookie init skipped', { error: err });
+  }
+}
+
+// Initialize cookies on module load
+initCookies().catch(() => {});
 
 // Modern User-Agent — matches real Chrome to avoid bot detection
 const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
@@ -33,57 +99,72 @@ export async function getBrowser(): Promise<Browser> {
     browser = null;
   }
 
-  // Circuit breaker: if we've failed too many times, wait before retrying
-  if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-    const msg = `Browser circuit breaker open: ${consecutiveFailures} consecutive launch failures. Resetting.`;
-    logger.error(msg);
-    consecutiveFailures = 0; // Reset so next attempt tries fresh
-    // Small delay to avoid rapid-fire relaunches
-    await new Promise(r => setTimeout(r, 2000));
+  // Prevent concurrent launches — serialize browser creation
+  if (browserLock) {
+    return browserLock;
   }
 
-  try {
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--disable-extensions',
-        '--disable-background-networking',
-        '--disable-software-rasterizer',
-        '--disable-translate',
-        '--disable-sync',
-        '--disable-default-apps',
-        '--no-first-run',
-        '--no-zygote',              // Better for containers than --single-process
-        '--js-flags=--max-old-space-size=256', // Cap V8 heap at 256MB
-      ],
-    });
+  browserLock = (async () => {
+    // Circuit breaker: if we've failed too many times, wait before retrying
+    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+      const msg = `Browser circuit breaker open: ${consecutiveFailures} consecutive launch failures. Resetting.`;
+      logger.error(msg);
+      consecutiveFailures = 0;
+      await new Promise(r => setTimeout(r, 2000));
+    }
 
-    // Auto-recover on unexpected disconnect
-    browser.on('disconnected', () => {
-      logger.warn('Browser disconnected unexpectedly');
+    try {
+      const b = await chromium.launch({
+        headless: true,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-gpu',
+          '--disable-extensions',
+          '--disable-background-networking',
+          '--disable-software-rasterizer',
+          '--disable-translate',
+          '--disable-sync',
+          '--disable-default-apps',
+          '--no-first-run',
+          '--no-zygote',
+          '--disable-blink-features=AutomationControlled', // Avoid bot detection
+          '--js-flags=--max-old-space-size=512', // 512MB heap — 256 was too tight for MFA
+        ],
+      });
+
+      b.on('disconnected', () => {
+        logger.warn('Browser disconnected unexpectedly');
+        browser = null;
+      });
+
+      browser = b;
+      consecutiveFailures = 0;
+      logger.info('Playwright browser launched');
+      return b;
+    } catch (err) {
+      consecutiveFailures++;
       browser = null;
-    });
+      logger.error('Failed to launch browser', { error: err, failures: consecutiveFailures });
+      throw new Error(`Browser launch failed (attempt ${consecutiveFailures}): ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      browserLock = null;
+    }
+  })();
 
-    consecutiveFailures = 0;
-    logger.info('Playwright browser launched');
-    return browser;
-  } catch (err) {
-    consecutiveFailures++;
-    browser = null;
-    logger.error('Failed to launch browser', { error: err, failures: consecutiveFailures });
-    throw new Error(`Browser launch failed (attempt ${consecutiveFailures}): ${err instanceof Error ? err.message : String(err)}`);
-  }
+  return browserLock;
 }
 
-export async function createPage(): Promise<Page> {
-  // Concurrency guard — prevent OOM from too many simultaneous pages
-  if (activePages >= MAX_CONCURRENT_PAGES) {
+export async function createPage(opts?: { mfaExpected?: boolean }): Promise<Page> {
+  // Atomic concurrency check — increment first, decrement on failure
+  activePages++;
+  if (activePages > MAX_CONCURRENT_PAGES) {
+    activePages--;
     throw new Error(`Browser concurrency limit reached (${MAX_CONCURRENT_PAGES} pages). Wait for current pages to close.`);
   }
+
+  const timeout = opts?.mfaExpected ? MFA_PAGE_TIMEOUT : PAGE_TIMEOUT;
 
   const b = await getBrowser();
 
@@ -91,7 +172,6 @@ export async function createPage(): Promise<Page> {
   const contextOpts = {
     userAgent: USER_AGENT,
     viewport: { width: 1280, height: 800 },
-    // Reduce detection — look like a real browser
     locale: 'en-US',
     timezoneId: 'America/New_York',
     javaScriptEnabled: true,
@@ -100,60 +180,87 @@ export async function createPage(): Promise<Page> {
   try {
     context = await b.newContext(contextOpts);
   } catch (err) {
-    // Context creation failed — browser is likely dead
     logger.error('Failed to create browser context, killing browser', { error: err });
+    activePages--;
     await killBrowser();
     // Retry once with a fresh browser
+    activePages++;
     const fresh = await getBrowser();
     context = await fresh.newContext(contextOpts);
   }
 
-  const page = await context.newPage();
-  activePages++;
+  let page: Page;
+  try {
+    page = await context.newPage();
+  } catch (err) {
+    activePages--;
+    throw err;
+  }
 
-  // Default navigation timeout for all goto calls on this page
-  page.setDefaultNavigationTimeout(PAGE_TIMEOUT);
-  page.setDefaultTimeout(PAGE_TIMEOUT);
+  // Set timeouts based on whether MFA is expected
+  page.setDefaultNavigationTimeout(timeout);
+  page.setDefaultTimeout(timeout);
 
   return page;
 }
 
-/** Save cookies from a page's context for a specific domain group */
+/** Save cookies from a page's context for a specific domain group — persists to disk */
 export async function saveCookies(page: Page, domain: string): Promise<void> {
   try {
     const ctx = page.context();
     const cookies = await ctx.cookies();
     if (cookies.length > 0) {
       storedCookies.set(domain, cookies);
-      logger.info('Saved browser cookies', { domain, count: cookies.length });
+      // Persist to disk so cookies survive process restarts
+      await persistCookiesToDisk(domain, cookies);
+      logger.info('Saved browser cookies (memory + disk)', { domain, count: cookies.length });
     }
   } catch (err) {
     logger.debug('Failed to save cookies', { error: err });
   }
 }
 
-/** Create a page with restored cookies for a domain */
-export async function createPageWithCookies(domain: string): Promise<Page> {
-  const page = await createPage();
-  const cookies = storedCookies.get(domain);
+/** Create a page with restored cookies for a domain (checks disk if not in memory) */
+export async function createPageWithCookies(domain: string, opts?: { mfaExpected?: boolean }): Promise<Page> {
+  const page = await createPage(opts);
+
+  // Try memory first, then disk
+  let cookies = storedCookies.get(domain);
+  if (!cookies || cookies.length === 0) {
+    cookies = await loadCookiesFromDisk(domain) || undefined;
+    if (cookies) {
+      storedCookies.set(domain, cookies); // Cache in memory
+    }
+  }
+
   if (cookies && cookies.length > 0) {
     try {
-      await page.context().addCookies(cookies);
-      logger.info('Restored browser cookies', { domain, count: cookies.length });
+      // Filter out expired cookies before restoring
+      const now = Date.now() / 1000;
+      const validCookies = cookies.filter((c: any) => !c.expires || c.expires === -1 || c.expires > now);
+      if (validCookies.length > 0) {
+        await page.context().addCookies(validCookies);
+        logger.info('Restored browser cookies', { domain, count: validCookies.length, expired: cookies.length - validCookies.length });
+      }
     } catch (err) {
-      logger.debug('Failed to restore cookies', { error: err });
+      logger.warn('Failed to restore cookies — continuing without them', { error: err, domain });
     }
   }
   return page;
 }
 
-/** Safely close a page and its context, ignoring errors */
+/** Safely close a page (NOT its context — other pages may share it) */
 export async function safeClosePage(page: Page | null): Promise<void> {
   if (!page) return;
   try {
+    // Close just the page, then close the context only if it has no other pages
     const ctx = page.context();
     await page.close().catch(() => {});
-    await ctx.close().catch(() => {});
+    // Check if context has other open pages before closing it
+    const remainingPages = ctx.pages();
+    if (remainingPages.length === 0) {
+      await ctx.close().catch(() => {});
+    }
   } catch {}
   activePages = Math.max(0, activePages - 1);
 }

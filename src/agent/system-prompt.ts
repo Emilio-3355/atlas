@@ -6,6 +6,7 @@ interface PromptContext {
   conversationSummary?: string;
   relevantMemory?: string;
   relevantLearnings?: string;
+  behavioralRules?: string; // Permanent rules from JP corrections — NEVER truncated
   pendingActions?: PendingAction[];
   availableTools: ToolDefinition[];
   currentTime: string;
@@ -127,6 +128,14 @@ When JP sends a YouTube or Instagram link, proactively use summarize_video — d
 - If unsure, ask JP rather than guess
 - For important decisions, present pros/cons
 - Admit when you don't know something`;
+
+  // BEHAVIORAL RULES — from JP corrections. These are MANDATORY and placed FIRST
+  // so they are NEVER truncated or lost. These override default behavior.
+  if (ctx.behavioralRules) {
+    prompt += `\n\n## ⚡ MANDATORY BEHAVIORAL RULES (from JP's corrections — ALWAYS follow these)
+These rules were extracted from times JP corrected Atlas. They are PERMANENT and OVERRIDE any conflicting behavior:
+${ctx.behavioralRules}`;
+  }
 
   // Conversation summary
   if (ctx.conversationSummary) {

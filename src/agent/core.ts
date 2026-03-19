@@ -121,10 +121,11 @@ async function _processMessageInner(phone: string, incomingMessage: string, chan
   // Load recent messages for context
   const recentMessages = await getRecentMessages(conversation.id, 20);
 
-  // Build context from memory + learnings
+  // Build context from memory + learnings + behavioral rules
   const contextResult = await buildContext(incomingMessage);
   const relevantMemory = contextResult.memory;
   const relevantLearnings = contextResult.learnings;
+  const behavioralRules = contextResult.behavioralRules;
 
   // Check if conversation needs compaction
   if (await shouldCompact(conversation.id)) {
@@ -199,12 +200,13 @@ async function _processMessageInner(phone: string, incomingMessage: string, chan
   const registry = getToolRegistry();
   const availableTools = registry.getAll();
 
-  // Build system prompt (inject active correction rule if detected)
+  // Build system prompt (inject active correction rule + permanent behavioral rules)
   const systemPrompt = buildSystemPrompt({
     language,
     conversationSummary: conversation.summary || undefined,
     relevantMemory,
     relevantLearnings,
+    behavioralRules: behavioralRules || undefined,
     pendingActions,
     availableTools,
     currentTime: new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }),
@@ -553,35 +555,54 @@ async function executeToolCall(toolName: string, input: Record<string, any>, ctx
     return { success: false, error: `Blocked by hook: ${preResult.reason || 'no reason'}` };
   }
 
-  try {
-    let result = await tool.execute(preResult.input, ctx);
+  const MAX_RETRIES = 2;
+  let lastError: string = '';
 
-    // Run post-tool hooks (can modify result)
-    result = await hookManager.runPostToolHooks(hookCtx, result);
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      let result = await tool.execute(attempt === 0 ? preResult.input : input, ctx);
 
-    // Learn from failures (non-blocking)
-    if (!result.success) {
-      learnFromExecution(toolName, input, false, result.error).catch(() => {});
+      // Run post-tool hooks (can modify result)
+      result = await hookManager.runPostToolHooks(hookCtx, result);
+
+      // Learn from failures (non-blocking)
+      if (!result.success) {
+        learnFromExecution(toolName, input, false, result.error).catch(() => {});
+      }
+
+      return result;
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      logger.error('Tool execution error', { tool: toolName, error: err, attempt });
+
+      // Run on-error hooks (can trigger retry)
+      const errorResult = await hookManager.runOnErrorHooks(
+        err instanceof Error ? err : new Error(String(err)),
+        hookCtx,
+      );
+
+      if (errorResult.fallback) {
+        return { success: true, data: errorResult.fallback };
+      }
+
+      // Only retry on transient errors (timeout, network, etc.)
+      const isTransient = errorResult.retry === true ||
+        /timeout|ECONNRESET|ENOTFOUND|ETIMEDOUT|socket hang up|network/i.test(lastError);
+
+      if (isTransient && attempt < MAX_RETRIES) {
+        const delay = Math.min(1000 * Math.pow(2, attempt), 5000); // 1s, 2s
+        logger.info('Retrying tool after transient error', { tool: toolName, attempt: attempt + 1, delayMs: delay });
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+
+      // Non-transient or max retries exhausted
+      learnFromExecution(toolName, input, false, lastError).catch(() => {});
+      return { success: false, error: lastError };
     }
-
-    return result;
-  } catch (err) {
-    logger.error('Tool execution error', { tool: toolName, error: err });
-
-    // Learn from exceptions (non-blocking)
-    learnFromExecution(toolName, input, false, err instanceof Error ? err.message : String(err)).catch(() => {});
-
-    // Run on-error hooks (can trigger retry)
-    const errorResult = await hookManager.runOnErrorHooks(
-      err instanceof Error ? err : new Error(String(err)),
-      hookCtx,
-    );
-    if (errorResult.fallback) {
-      return { success: true, data: errorResult.fallback };
-    }
-
-    return { success: false, error: err instanceof Error ? err.message : String(err) };
   }
+
+  return { success: false, error: lastError };
 }
 
 async function createPendingAction(

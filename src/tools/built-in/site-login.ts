@@ -131,9 +131,10 @@ async function autoFillLoginForm(
 
         if (usernameField && passwordField) {
           await usernameField.fill(username);
+          await page.waitForTimeout(300); // Small delay between fields (some forms need it)
           await passwordField.fill(password);
 
-          // Find and click submit
+          // Find and click submit — then WAIT for navigation
           const submitSelectors = [
             'button[type="submit"]',
             'input[type="submit"]',
@@ -147,27 +148,41 @@ async function autoFillLoginForm(
             '.submit-button',
           ];
 
+          let submitted = false;
           for (const sel of submitSelectors) {
             try {
               const btn = await frame.$(sel);
               if (btn && await btn.isVisible()) {
-                await btn.click();
-                logger.info('Clicked submit', { selector: sel });
-                return { filled: true };
+                // Click and wait for navigation simultaneously
+                await Promise.all([
+                  btn.click(),
+                  page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {}),
+                ]);
+                logger.info('Clicked submit and waited for navigation', { selector: sel });
+                submitted = true;
+                break;
               }
             } catch { /* skip */ }
           }
 
-          // No submit button found — try pressing Enter
-          await passwordField.press('Enter');
-          logger.info('No submit button found, pressed Enter');
+          if (!submitted) {
+            // No submit button found — try pressing Enter and waiting
+            await Promise.all([
+              passwordField.press('Enter'),
+              page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {}),
+            ]);
+            logger.info('No submit button found, pressed Enter and waited');
+          }
+
+          // Extra wait for any JS redirects after form submission
+          await page.waitForTimeout(2000);
           return { filled: true };
         }
 
         // Maybe it's a two-step login (username first, then password)
         if (usernameField && !passwordField) {
           await usernameField.fill(username);
-          // Try submitting / pressing next
+          // Try submitting / pressing next — wait for navigation
           const nextSelectors = [
             'button:has-text("Next")',
             'button:has-text("Continue")',
@@ -175,29 +190,52 @@ async function autoFillLoginForm(
             'button[type="submit"]',
             'input[type="submit"]',
           ];
+          let clickedNext = false;
           for (const sel of nextSelectors) {
             try {
               const btn = await frame.$(sel);
               if (btn && await btn.isVisible()) {
-                await btn.click();
+                await Promise.all([
+                  btn.click(),
+                  page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {}),
+                ]);
+                clickedNext = true;
                 break;
               }
             } catch { /* skip */ }
           }
-          // Wait for password page
-          await page.waitForTimeout(2000);
 
-          // Now look for password field again
-          for (const sel of passwordSelectors) {
-            try {
-              const el = await frame.$(sel);
-              if (el && await el.isVisible()) {
-                await el.fill(password);
-                await el.press('Enter');
-                logger.info('Two-step login: filled password');
-                return { filled: true };
+          if (!clickedNext) {
+            // Try pressing Enter on username field
+            await Promise.all([
+              usernameField.press('Enter'),
+              page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {}),
+            ]);
+          }
+
+          // Wait for password page to render (adaptive — try multiple times)
+          for (let attempt = 0; attempt < 5; attempt++) {
+            await page.waitForTimeout(1500);
+
+            // Check all frames again (page may have changed)
+            const frames2 = [page, ...page.frames()];
+            for (const f of frames2) {
+              for (const sel of passwordSelectors) {
+                try {
+                  const el = await f.$(sel);
+                  if (el && await el.isVisible()) {
+                    await el.fill(password);
+                    await Promise.all([
+                      el.press('Enter'),
+                      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {}),
+                    ]);
+                    logger.info('Two-step login: filled password', { attempt });
+                    await page.waitForTimeout(2000);
+                    return { filled: true };
+                  }
+                } catch { /* skip */ }
               }
-            } catch { /* skip */ }
+            }
           }
         }
       } catch {
@@ -304,12 +342,13 @@ export const siteLoginTool: ToolDefinition = {
 
         // Use persistent cookies — avoids Duo re-prompts for Columbia
         const cookieDomain = siteId.includes('columbia') || ['vergil', 'courseworks', 'lionmail'].includes(siteId) ? 'columbia' : siteId;
-        const page = await createPageWithCookies(cookieDomain);
+        const isColumbiaSite = ['vergil', 'courseworks', 'lionmail'].includes(siteId);
+        const page = await createPageWithCookies(cookieDomain, { mfaExpected: isColumbiaSite });
 
         try {
-          // Navigate to login page
+          // Navigate to login page (use MFA-aware timeout for Columbia)
           logger.info('site_login: navigating', { site: siteId, url: loginUrl });
-          await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+          await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
           await page.waitForTimeout(2000);
 
           // Auto-detect and fill the login form
@@ -355,84 +394,143 @@ export const siteLoginTool: ToolDefinition = {
           if (isMfaPage) {
             logger.info('site_login: MFA detected, attempting auto-push');
 
-            // Try clicking Duo push buttons (check frames too)
+            // Wait a moment for Duo iframe to fully load
+            await page.waitForTimeout(3000);
+
+            // Try clicking Duo push buttons — check ALL frames including nested iframes
+            // Duo v4 uses an iframe, so we need to check deeply
+            let pushClicked = false;
+            const pushBtns = [
+              'button:has-text("Send Me a Push")',
+              'button:has-text("Send Push")',
+              'button:has-text("Duo Push")',
+              'button:has-text("Push")',
+              '#duo-push',
+              '.push-label',
+              'button[data-testid="push-button"]',
+              // Duo Universal Prompt (v4) selectors
+              'button.auth-button.positive',
+              'button[type="submit"]',
+            ];
+
+            // Re-fetch frames after wait (Duo iframe may have loaded)
             const allFrames = [page, ...page.frames()];
+            logger.info('site_login: checking frames for Duo push button', { frameCount: allFrames.length });
+
             for (const frame of allFrames) {
+              if (pushClicked) break;
               try {
-                const pushBtns = [
-                  'button:has-text("Send Me a Push")',
-                  'button:has-text("Send Push")',
-                  'button:has-text("Duo Push")',
-                  '#duo-push',
-                  '.push-label',
-                  'button[data-testid="push-button"]',
-                ];
                 for (const sel of pushBtns) {
-                  const btn = await frame.$(sel);
-                  if (btn && await btn.isVisible().catch(() => false)) {
-                    await btn.click();
-                    logger.info('site_login: Duo push button clicked', { selector: sel });
+                  try {
+                    const btn = await frame.$(sel);
+                    if (btn) {
+                      const visible = await btn.isVisible().catch(() => false);
+                      if (visible) {
+                        await btn.click();
+                        logger.info('site_login: Duo push button clicked', { selector: sel, frameUrl: frame.url?.() || 'main' });
+                        pushClicked = true;
+                        break;
+                      }
+                    }
+                  } catch { /* selector failed in this frame */ }
+                }
+              } catch { /* frame access failed */ }
+            }
+
+            if (!pushClicked) {
+              logger.warn('site_login: Could not find Duo push button — waiting for manual push');
+            }
+
+            // Wait up to 90 seconds for MFA approval (was 65s — too short)
+            let approved = false;
+            const duoStartUrl = currentUrl;
+            const MFA_WAIT_ITERATIONS = 30; // 30 × 3s = 90s
+            for (let i = 0; i < MFA_WAIT_ITERATIONS; i++) {
+              await page.waitForTimeout(3000);
+
+              try {
+                currentUrl = page.url();
+              } catch {
+                // Page might have navigated and old reference is dead
+                break;
+              }
+
+              // Check if we're past MFA — URL changed away from Duo/CAS
+              const onDuoOrCas = currentUrl.includes('duosecurity.com') ||
+                currentUrl.includes('duo.columbia.edu') ||
+                currentUrl.includes('cas.columbia.edu/cas/login') ||
+                currentUrl.includes('cas.columbia.edu/cas/') ||
+                currentUrl === duoStartUrl;
+
+              if (!onDuoOrCas && currentUrl !== loginUrl) {
+                approved = true;
+                logger.info('site_login: MFA approved — URL changed', { newUrl: currentUrl });
+                break;
+              }
+
+              // Check if redirected to a known success page
+              if (knownSite?.postLoginUrl && currentUrl.includes(new URL(knownSite.postLoginUrl).hostname)) {
+                approved = true;
+                logger.info('site_login: MFA approved — reached post-login URL');
+                break;
+              }
+
+              // Check page content for success indicators (in ALL frames)
+              try {
+                const bodyText = await page.evaluate('(document.body?.innerText || "").slice(0, 2000)').catch(() => '');
+                if (typeof bodyText === 'string') {
+                  const lower = bodyText.toLowerCase();
+                  if (lower.includes('success') || lower.includes('authenticated') ||
+                      lower.includes('welcome') || lower.includes('logged in') ||
+                      lower.includes('my account') || lower.includes('dashboard')) {
+                    approved = true;
+                    logger.info('site_login: MFA approved — success text found');
                     break;
                   }
                 }
-              } catch { /* try next frame */ }
-            }
+              } catch { /* page might be navigating */ }
 
-            // Wait up to 65 seconds for MFA approval
-            let approved = false;
-            const duoStartUrl = currentUrl;
-            for (let i = 0; i < 22; i++) {
-              await page.waitForTimeout(3000);
-              currentUrl = page.url();
-
-              // Check if we're past MFA — URL changed to something that's NOT the Duo/CAS page
-              const stillOnDuo = currentUrl.includes('duosecurity.com') ||
-                currentUrl.includes('duo.columbia.edu') ||
-                currentUrl === duoStartUrl;
-              const stillOnCas = currentUrl.includes('cas.columbia.edu/cas/login');
-
-              if (!stillOnDuo && !stillOnCas && currentUrl !== loginUrl) {
-                approved = true;
-                break;
-              }
-
-              // Also check if a known success indicator matches
-              if (knownSite?.postLoginUrl && currentUrl.includes(new URL(knownSite.postLoginUrl).hostname)) {
-                approved = true;
-                break;
-              }
-
-              // Check page content for success indicators
-              const bodyText = await page.evaluate('(document.body?.innerText || "").slice(0, 1000)').catch(() => '');
-              if (typeof bodyText === 'string' && (bodyText.includes('Success') || bodyText.includes('Authenticated') || bodyText.includes('Welcome'))) {
-                approved = true;
-                break;
+              // Log progress every 15 seconds so we know it's still trying
+              if (i > 0 && i % 5 === 0) {
+                logger.info('site_login: still waiting for MFA approval', { secondsElapsed: (i + 1) * 3, currentUrl });
               }
             }
 
             if (!approved) {
-              // Save cookies even on timeout — partial session might help next time
+              // Save cookies even on timeout — partial session helps next time
               await saveCookies(page, cookieDomain);
               await safeClosePage(page);
-              return { success: false, error: 'MFA timeout (65s). Approve the Duo push on your phone and try again. Tell JP: check your Duo Mobile app.' };
+              return { success: false, error: 'MFA timeout (90s). Approve the Duo push on your phone and try again.' };
             }
+
+            // Wait for any post-MFA redirects to complete
+            await page.waitForTimeout(3000);
 
             // Try to click "Remember this browser" / "Yes, trust browser" after Duo
             try {
               const trustSelectors = [
                 'button:has-text("Yes, trust browser")',
+                'button:has-text("Trust Browser")',
                 'button:has-text("Remember")',
+                'button:has-text("Trust")',
                 'input[name="dampen_choice"][value="true"]',
                 '#trust-browser-button',
-                'button:has-text("Trust")',
+                // Duo Universal Prompt
+                '#trust-this-browser',
+                'button.trust-browser-button',
               ];
-              for (const sel of trustSelectors) {
-                const btn = await page.$(sel);
-                if (btn && await btn.isVisible().catch(() => false)) {
-                  await btn.click();
-                  logger.info('Clicked "trust browser" after Duo');
-                  await page.waitForTimeout(2000);
-                  break;
+              const allFramesPost = [page, ...page.frames()];
+              for (const frame of allFramesPost) {
+                for (const sel of trustSelectors) {
+                  try {
+                    const btn = await frame.$(sel);
+                    if (btn && await btn.isVisible().catch(() => false)) {
+                      await btn.click();
+                      logger.info('Clicked "trust browser" after Duo', { selector: sel });
+                      await page.waitForTimeout(2000);
+                      break;
+                    }
+                  } catch { /* skip */ }
                 }
               }
             } catch { /* non-critical */ }
