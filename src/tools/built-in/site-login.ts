@@ -4,73 +4,40 @@ import { query } from '../../config/database.js';
 import { tagContent } from '../../security/content-trust.js';
 import logger from '../../utils/logger.js';
 
-/**
- * Known site login configurations.
- * Each entry defines how to log into a specific site via Playwright.
- */
-interface SiteLoginConfig {
+// ===== Known site configs (shortcuts — but generic login works for any URL) =====
+
+interface SiteConfig {
   name: string;
   loginUrl: string;
-  usernameSelector: string;
-  passwordSelector: string;
-  submitSelector: string;
-  /** URL or pattern that indicates successful login */
-  successIndicator: string;
-  /** Optional: URL to navigate to after login */
   postLoginUrl?: string;
-  /** Wait time after submit (ms) */
-  waitAfterSubmit?: number;
 }
 
-const KNOWN_SITES: Record<string, SiteLoginConfig> = {
+const KNOWN_SITES: Record<string, SiteConfig> = {
   vergil: {
     name: 'Vergil (Columbia)',
     loginUrl: 'https://cas.columbia.edu/cas/login?service=https%3A%2F%2Fvergil.registrar.columbia.edu%2F',
-    usernameSelector: '#username',
-    passwordSelector: '#password',
-    submitSelector: 'input[type="submit"], button[type="submit"]',
-    successIndicator: 'vergil.registrar.columbia.edu',
     postLoginUrl: 'https://vergil.registrar.columbia.edu/',
-    waitAfterSubmit: 3000,
   },
   courseworks: {
     name: 'Courseworks (Columbia Canvas)',
     loginUrl: 'https://courseworks2.columbia.edu/login/saml',
-    usernameSelector: '#username',
-    passwordSelector: '#password',
-    submitSelector: 'input[type="submit"], button[type="submit"]',
-    successIndicator: 'courseworks2.columbia.edu',
-    waitAfterSubmit: 4000,
   },
   lionmail: {
     name: 'LionMail (Columbia Gmail)',
     loginUrl: 'https://cas.columbia.edu/cas/login?service=https%3A%2F%2Fmail.google.com%2Fa%2Fcolumbia.edu',
-    usernameSelector: '#username',
-    passwordSelector: '#password',
-    submitSelector: 'input[type="submit"], button[type="submit"]',
-    successIndicator: 'mail.google.com',
-    waitAfterSubmit: 4000,
   },
 };
 
-/**
- * Store credentials securely in the database.
- * Claude never sees the actual password — it just calls store_credentials
- * with the site name and the values JP provides.
- */
+// ===== Credential storage =====
+
 async function storeCredentials(site: string, username: string, password: string): Promise<void> {
   await query(
     `INSERT INTO memory_facts (category, key, value, source, confidence, metadata)
      VALUES ('site_credentials', $1, $2, 'jp_provided', 1.0, $3)
      ON CONFLICT (category, key)
      DO UPDATE SET value = $2, metadata = $3, updated_at = NOW()`,
-    [
-      site,
-      username, // Store username as value
-      JSON.stringify({ has_password: true, stored_at: new Date().toISOString() }),
-    ]
+    [site, username, JSON.stringify({ stored_at: new Date().toISOString() })]
   );
-  // Store password separately (not in the value field Claude might see in context)
   await query(
     `INSERT INTO memory_facts (category, key, value, source, confidence, metadata)
      VALUES ('site_credentials_secret', $1, $2, 'jp_provided', 1.0, '{}')
@@ -81,23 +48,176 @@ async function storeCredentials(site: string, username: string, password: string
 }
 
 async function getCredentials(site: string): Promise<{ username: string; password: string } | null> {
-  const userResult = await query(
-    `SELECT value FROM memory_facts WHERE category = 'site_credentials' AND key = $1`,
-    [site]
-  );
-  const passResult = await query(
-    `SELECT value FROM memory_facts WHERE category = 'site_credentials_secret' AND key = $1`,
-    [site]
-  );
+  const [userResult, passResult] = await Promise.all([
+    query(`SELECT value FROM memory_facts WHERE category = 'site_credentials' AND key = $1`, [site]),
+    query(`SELECT value FROM memory_facts WHERE category = 'site_credentials_secret' AND key = $1`, [site]),
+  ]);
   if (userResult.rows.length === 0 || passResult.rows.length === 0) return null;
   return { username: userResult.rows[0].value, password: passResult.rows[0].value };
 }
 
+// ===== Generic login engine =====
+
+/**
+ * Auto-detect and fill a login form on ANY page.
+ * Finds username/email and password fields by type, name, id, placeholder, label.
+ * Works for CAS, Google, standard forms, etc.
+ */
+async function autoFillLoginForm(
+  page: any,
+  username: string,
+  password: string,
+): Promise<{ filled: boolean; error?: string }> {
+  try {
+    // Wait for the page to be interactive
+    await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(2000);
+
+    // Check all frames (main + iframes like Duo)
+    const frames = [page, ...page.frames()];
+
+    for (const frame of frames) {
+      try {
+        // Find username/email field
+        const usernameSelectors = [
+          'input[type="text"][name*="user" i]',
+          'input[type="text"][name*="email" i]',
+          'input[type="text"][id*="user" i]',
+          'input[type="text"][id*="email" i]',
+          'input[type="email"]',
+          'input[name="username"]',
+          'input[name="login"]',
+          'input[id="username"]',
+          'input[id="login"]',
+          'input[type="text"][placeholder*="user" i]',
+          'input[type="text"][placeholder*="email" i]',
+          'input[type="text"][autocomplete="username"]',
+          // Catch-all: first visible text input
+          'input[type="text"]:visible',
+        ];
+
+        const passwordSelectors = [
+          'input[type="password"]',
+          'input[name="password"]',
+          'input[id="password"]',
+        ];
+
+        let usernameField = null;
+        let passwordField = null;
+
+        // Find username field
+        for (const sel of usernameSelectors) {
+          try {
+            const el = await frame.$(sel);
+            if (el && await el.isVisible()) {
+              usernameField = el;
+              logger.info('Found username field', { selector: sel });
+              break;
+            }
+          } catch { /* skip */ }
+        }
+
+        // Find password field
+        for (const sel of passwordSelectors) {
+          try {
+            const el = await frame.$(sel);
+            if (el && await el.isVisible()) {
+              passwordField = el;
+              logger.info('Found password field', { selector: sel });
+              break;
+            }
+          } catch { /* skip */ }
+        }
+
+        if (usernameField && passwordField) {
+          await usernameField.fill(username);
+          await passwordField.fill(password);
+
+          // Find and click submit
+          const submitSelectors = [
+            'button[type="submit"]',
+            'input[type="submit"]',
+            'button:has-text("Log in")',
+            'button:has-text("Login")',
+            'button:has-text("Sign in")',
+            'button:has-text("Submit")',
+            'button:has-text("Iniciar")',
+            '#submit',
+            '.login-button',
+            '.submit-button',
+          ];
+
+          for (const sel of submitSelectors) {
+            try {
+              const btn = await frame.$(sel);
+              if (btn && await btn.isVisible()) {
+                await btn.click();
+                logger.info('Clicked submit', { selector: sel });
+                return { filled: true };
+              }
+            } catch { /* skip */ }
+          }
+
+          // No submit button found — try pressing Enter
+          await passwordField.press('Enter');
+          logger.info('No submit button found, pressed Enter');
+          return { filled: true };
+        }
+
+        // Maybe it's a two-step login (username first, then password)
+        if (usernameField && !passwordField) {
+          await usernameField.fill(username);
+          // Try submitting / pressing next
+          const nextSelectors = [
+            'button:has-text("Next")',
+            'button:has-text("Continue")',
+            'button:has-text("Siguiente")',
+            'button[type="submit"]',
+            'input[type="submit"]',
+          ];
+          for (const sel of nextSelectors) {
+            try {
+              const btn = await frame.$(sel);
+              if (btn && await btn.isVisible()) {
+                await btn.click();
+                break;
+              }
+            } catch { /* skip */ }
+          }
+          // Wait for password page
+          await page.waitForTimeout(2000);
+
+          // Now look for password field again
+          for (const sel of passwordSelectors) {
+            try {
+              const el = await frame.$(sel);
+              if (el && await el.isVisible()) {
+                await el.fill(password);
+                await el.press('Enter');
+                logger.info('Two-step login: filled password');
+                return { filled: true };
+              }
+            } catch { /* skip */ }
+          }
+        }
+      } catch {
+        // Try next frame
+      }
+    }
+
+    return { filled: false, error: 'Could not find login form fields on the page' };
+  } catch (err) {
+    return { filled: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+// ===== Tool definition =====
+
 export const siteLoginTool: ToolDefinition = {
   name: 'site_login',
-  description: `Log into a website and extract content after authentication. Supports: vergil (Columbia student portal), courseworks (Canvas), lionmail (Columbia Gmail). Use this when JP asks to check his courses, assignments, grades, or any Columbia portal. Actions: login (log in and get page content), store_credentials (save JP's username/password for a site), list_sites (show available sites).`,
+  description: `Log into any website and extract content after authentication. Known shortcuts: vergil, courseworks, lionmail. Also works with any URL — just provide login_url. Actions: login (log in and get content), store_credentials (save credentials), list_sites (show saved sites).`,
   category: 'action',
-  requiresApproval: false, // JP explicitly wants this to work without friction
+  requiresApproval: false,
   inputSchema: {
     type: 'object' as const,
     properties: {
@@ -108,20 +228,15 @@ export const siteLoginTool: ToolDefinition = {
       },
       site: {
         type: 'string',
-        description: 'Site identifier (vergil, courseworks, lionmail)',
+        description: 'Site identifier (vergil, courseworks, lionmail) or any name to store credentials under',
       },
-      username: {
+      login_url: {
         type: 'string',
-        description: 'Username to store (only for store_credentials)',
+        description: 'Login page URL. Required for non-known sites. Overrides known site URL if provided.',
       },
-      password: {
-        type: 'string',
-        description: 'Password to store (only for store_credentials)',
-      },
-      target_url: {
-        type: 'string',
-        description: 'Optional: specific URL to navigate to after login',
-      },
+      username: { type: 'string', description: 'Username (for store_credentials)' },
+      password: { type: 'string', description: 'Password (for store_credentials)' },
+      target_url: { type: 'string', description: 'URL to navigate to after login' },
     },
     required: ['action'],
   },
@@ -132,6 +247,7 @@ export const siteLoginTool: ToolDefinition = {
     input: {
       action: string;
       site?: string;
+      login_url?: string;
       username?: string;
       password?: string;
       target_url?: string;
@@ -139,185 +255,182 @@ export const siteLoginTool: ToolDefinition = {
     ctx: ToolContext,
   ): Promise<ToolResult> {
     try {
+      // === LIST SITES ===
       if (input.action === 'list_sites') {
         const sites = Object.entries(KNOWN_SITES).map(([id, config]) => ({
-          id,
-          name: config.name,
-          loginUrl: config.loginUrl,
+          id, name: config.name, loginUrl: config.loginUrl,
         }));
-        // Check which have stored credentials
         for (const site of sites) {
-          const creds = await getCredentials(site.id);
-          (site as any).hasCredentials = !!creds;
+          (site as any).hasCredentials = !!(await getCredentials(site.id));
+        }
+        // Also list custom stored credentials
+        const custom = await query(
+          `SELECT key FROM memory_facts WHERE category = 'site_credentials' AND key NOT IN ('vergil','courseworks','lionmail')`
+        );
+        for (const row of custom.rows) {
+          sites.push({ id: row.key, name: row.key, loginUrl: 'custom', hasCredentials: true } as any);
         }
         return { success: true, data: { sites } };
       }
 
+      // === STORE CREDENTIALS ===
       if (input.action === 'store_credentials') {
         if (!input.site || !input.username || !input.password) {
           return { success: false, error: 'site, username, and password are required' };
         }
         await storeCredentials(input.site.toLowerCase(), input.username, input.password);
-        return {
-          success: true,
-          data: { message: `Credentials stored for ${input.site}. You can now use login action.` },
-        };
+        return { success: true, data: { message: `Credentials saved for ${input.site}. Ready to login.` } };
       }
 
+      // === LOGIN ===
       if (input.action === 'login') {
-        if (!input.site) {
-          return { success: false, error: 'site is required' };
+        if (!input.site && !input.login_url) {
+          return { success: false, error: 'Provide site name or login_url' };
         }
 
-        const siteId = input.site.toLowerCase();
-        const config = KNOWN_SITES[siteId];
-        if (!config) {
-          return {
-            success: false,
-            error: `Unknown site: ${siteId}. Available: ${Object.keys(KNOWN_SITES).join(', ')}`,
-          };
+        const siteId = (input.site || 'custom').toLowerCase();
+        const knownSite = KNOWN_SITES[siteId];
+        const loginUrl = input.login_url || knownSite?.loginUrl;
+
+        if (!loginUrl) {
+          return { success: false, error: `Unknown site "${siteId}" and no login_url provided. Available: ${Object.keys(KNOWN_SITES).join(', ')}` };
         }
 
-        // Get stored credentials
+        // Get credentials
         const creds = await getCredentials(siteId);
         if (!creds) {
-          return {
-            success: false,
-            error: `No credentials stored for ${siteId}. Ask JP to provide them, then use store_credentials action first.`,
-          };
+          return { success: false, error: `No credentials stored for "${siteId}". Use store_credentials first.` };
         }
 
         const page = await createPage();
+        const startUrl = page.url();
 
         try {
           // Navigate to login page
-          logger.info('Navigating to login page', { site: siteId, url: config.loginUrl });
-          await page.goto(config.loginUrl, { waitUntil: 'networkidle', timeout: 20000 });
+          logger.info('site_login: navigating', { site: siteId, url: loginUrl });
+          await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+          await page.waitForTimeout(1500);
 
-          // Wait for the login form to appear (handles JS-rendered pages)
-          logger.info('Waiting for login form fields...');
-          await page.waitForSelector(config.usernameSelector, { state: 'visible', timeout: 15000 });
-          await page.waitForSelector(config.passwordSelector, { state: 'visible', timeout: 10000 });
+          // Auto-detect and fill the login form
+          const fillResult = await autoFillLoginForm(page, creds.username, creds.password);
 
-          // Fill credentials
-          await page.fill(config.usernameSelector, creds.username);
-          await page.fill(config.passwordSelector, creds.password);
+          if (!fillResult.filled) {
+            // Take screenshot for debugging
+            const screenshotBuf = await page.screenshot({ type: 'png' }).catch(() => null);
+            await page.close();
+            return {
+              success: false,
+              error: `Could not find login form on ${loginUrl}. ${fillResult.error || 'No username/password fields detected.'}`,
+            };
+          }
 
-          // Submit
-          await page.click(config.submitSelector);
-          await page.waitForTimeout(config.waitAfterSubmit || 3000);
+          // Wait for navigation after submit
+          await page.waitForTimeout(4000);
 
-          // Check initial result — might be error, MFA, or success
           let currentUrl = page.url();
-          let pageText = await page.evaluate(
-            '(document.body?.innerText || "").slice(0, 3000)'
-          ) as string;
+          let pageText = await page.evaluate('(document.body?.innerText || "").slice(0, 3000)') as string;
 
           // Check for wrong credentials
-          const hasLoginError = pageText.toLowerCase().includes('login incorrect') ||
+          const loginFailed = pageText.toLowerCase().includes('login incorrect') ||
             pageText.toLowerCase().includes('invalid credentials') ||
-            pageText.toLowerCase().includes('authentication failed');
+            pageText.toLowerCase().includes('invalid password') ||
+            pageText.toLowerCase().includes('authentication failed') ||
+            pageText.toLowerCase().includes('wrong password') ||
+            pageText.toLowerCase().includes('incorrect username');
 
-          if (hasLoginError) {
+          if (loginFailed) {
             await page.close();
-            return {
-              success: false,
-              error: 'Login failed — credentials are incorrect. Ask JP to provide the correct ones.',
-            };
+            return { success: false, error: 'Login failed — wrong credentials.' };
           }
 
-          // Check for Duo MFA — Columbia uses Duo after valid username/password
-          const isDuoPage = currentUrl.includes('duosecurity.com') ||
-            currentUrl.includes('duo.com') ||
-            pageText.toLowerCase().includes('duo') ||
+          // Check for MFA (Duo, TOTP, etc.)
+          const isMfaPage = currentUrl.includes('duo') ||
             pageText.toLowerCase().includes('two-factor') ||
+            pageText.toLowerCase().includes('verification code') ||
             pageText.toLowerCase().includes('push notification') ||
-            pageText.toLowerCase().includes('send me a push');
+            pageText.toLowerCase().includes('send me a push') ||
+            pageText.toLowerCase().includes('authenticator');
 
-          if (isDuoPage && !currentUrl.includes(config.successIndicator)) {
-            // Try to auto-send Duo push if button is available
-            try {
-              const pushButton = await page.$('button:has-text("Send Me a Push"), button:has-text("Send Push"), #trust-browser-button, .push-label');
-              if (pushButton) {
-                await pushButton.click();
-                logger.info('Duo push sent automatically');
-              }
-            } catch {
-              // Push button not found — that's ok
+          if (isMfaPage) {
+            logger.info('site_login: MFA detected, attempting auto-push');
+
+            // Try clicking Duo push buttons (check frames too)
+            const allFrames = [page, ...page.frames()];
+            for (const frame of allFrames) {
+              try {
+                const pushBtns = [
+                  'button:has-text("Send Me a Push")',
+                  'button:has-text("Send Push")',
+                  'button:has-text("Duo Push")',
+                  '#duo-push',
+                  '.push-label',
+                  'button[data-testid="push-button"]',
+                ];
+                for (const sel of pushBtns) {
+                  const btn = await frame.$(sel);
+                  if (btn && await btn.isVisible().catch(() => false)) {
+                    await btn.click();
+                    logger.info('site_login: Duo push button clicked', { selector: sel });
+                    break;
+                  }
+                }
+              } catch { /* try next frame */ }
             }
 
-            // Wait up to 60 seconds for MFA approval
-            logger.info('Waiting for Duo MFA approval...');
-            let mfaApproved = false;
-            for (let i = 0; i < 20; i++) {
+            // Wait up to 65 seconds for MFA approval
+            let approved = false;
+            for (let i = 0; i < 22; i++) {
               await page.waitForTimeout(3000);
               currentUrl = page.url();
-              if (currentUrl.includes(config.successIndicator)) {
-                mfaApproved = true;
+              // If URL changed away from login/duo pages, we're in
+              if (!currentUrl.includes('duo') &&
+                  !currentUrl.includes('cas.columbia.edu/cas/login') &&
+                  !currentUrl.includes('login') &&
+                  currentUrl !== loginUrl) {
+                approved = true;
                 break;
               }
-              // Check if we got redirected past Duo
-              if (!currentUrl.includes('duo') && !currentUrl.includes('cas.columbia.edu')) {
-                mfaApproved = true;
+              // Also check if a known success indicator matches
+              if (knownSite?.postLoginUrl && currentUrl.includes(new URL(knownSite.postLoginUrl).hostname)) {
+                approved = true;
                 break;
               }
             }
 
-            if (!mfaApproved) {
+            if (!approved) {
               await page.close();
-              return {
-                success: false,
-                error: 'MFA timeout — Duo push was sent but not approved within 60 seconds. Check your Duo app and try again.',
-              };
+              return { success: false, error: 'MFA timeout (65s). Approve the push on your phone and try again.' };
             }
           }
 
-          // Final check — are we logged in?
-          currentUrl = page.url();
-          const loginSucceeded = currentUrl.includes(config.successIndicator) ||
-            (!currentUrl.includes('cas.columbia.edu') && !currentUrl.includes('duo'));
-
-          if (!loginSucceeded) {
-            await page.close();
-            return {
-              success: false,
-              error: `Login may have failed. Ended up at: ${currentUrl}`,
-            };
-          }
-
-          // Navigate to target URL if specified
-          if (input.target_url) {
-            await page.goto(input.target_url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-            await page.waitForTimeout(2000);
-          } else if (config.postLoginUrl) {
-            await page.goto(config.postLoginUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+          // Navigate to target if specified
+          const targetUrl = input.target_url || knownSite?.postLoginUrl;
+          if (targetUrl && !currentUrl.includes(new URL(targetUrl).hostname)) {
+            await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
             await page.waitForTimeout(2000);
           }
 
-          // Extract page content
+          // Extract page content and links
           const content = await page.evaluate(`
             (() => {
-              ['script', 'style', 'nav', 'iframe', 'noscript'].forEach(sel =>
-                document.querySelectorAll(sel).forEach(el => el.remove())
+              ['script','style','iframe','noscript'].forEach(s =>
+                document.querySelectorAll(s).forEach(el => el.remove())
               );
               return (document.body?.innerText || '').replace(/\\n{3,}/g, '\\n\\n').trim().slice(0, 15000);
             })()
           `) as string;
 
-          // Extract links
           const links = await page.evaluate(`
             (() => {
-              const links = [];
-              const seen = new Set();
+              const links = [], seen = new Set();
               document.querySelectorAll('a[href]').forEach(a => {
                 const href = a.getAttribute('href') || '';
                 const text = (a.textContent || '').trim().slice(0, 100);
                 if (!href || !text || text.length < 2) return;
-                let fullUrl;
-                try { fullUrl = new URL(href, document.location.href).href; } catch { return; }
-                if (seen.has(fullUrl) || fullUrl.startsWith('javascript:')) return;
-                seen.add(fullUrl);
-                links.push({ text, url: fullUrl });
+                let url; try { url = new URL(href, location.href).href; } catch { return; }
+                if (seen.has(url) || url.startsWith('javascript:')) return;
+                seen.add(url);
+                links.push({ text, url });
               });
               return links.slice(0, 30);
             })()
@@ -330,15 +443,15 @@ export const siteLoginTool: ToolDefinition = {
             success: true,
             data: {
               loggedIn: true,
-              site: config.name,
+              site: knownSite?.name || siteId,
               url: finalUrl,
               content: tagContent(content, 'untrusted', finalUrl),
               links: links.slice(0, 20),
-              linksSummary: links.slice(0, 15).map(l => `  - "${l.text}" → ${l.url}`).join('\n'),
+              linksSummary: links.slice(0, 15).map(l => `  "${l.text}" → ${l.url}`).join('\n'),
             },
           };
         } catch (err) {
-          await page.close();
+          await page.close().catch(() => {});
           throw err;
         }
       }
@@ -346,7 +459,7 @@ export const siteLoginTool: ToolDefinition = {
       return { success: false, error: `Unknown action: ${input.action}` };
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      logger.error('Site login error', { error: errMsg, site: input.site });
+      logger.error('site_login error', { error: errMsg, site: input.site });
       return { success: false, error: errMsg };
     }
   },
