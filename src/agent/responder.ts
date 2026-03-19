@@ -11,7 +11,17 @@ export async function respondToUser(
   detectedLanguage?: string,
   channel: MessageChannel = 'whatsapp',
 ): Promise<void> {
-  if (channel === 'telegram') {
+  if (channel === 'voice') {
+    // Voice responses are delivered via TwiML, not through respondToUser.
+    // If this is called for voice (e.g., approval messages), forward to WhatsApp.
+    const { formatForWhatsApp } = await import('../utils/format.js');
+    const { sendWhatsAppMessage } = await import('../services/whatsapp.js');
+    const chunks = formatForWhatsApp(text);
+    for (const chunk of chunks) {
+      await sendWhatsAppMessage(phone, chunk);
+    }
+    return;
+  } else if (channel === 'telegram') {
     const chatId = phone.replace(/^tg:/, '');
     await sendTelegramMessage(chatId, text);
   } else if (channel === 'slack') {

@@ -12,7 +12,7 @@ export type TaskScheduleType = 'one_shot' | 'recurring' | 'interval';
 
 export type TaskDelivery = 'whatsapp' | 'telegram' | 'internal' | 'conditional';
 
-export type MessageChannel = 'whatsapp' | 'telegram' | 'slack';
+export type MessageChannel = 'whatsapp' | 'telegram' | 'slack' | 'voice';
 
 export interface ImageAttachment {
   /** Base64-encoded image data */

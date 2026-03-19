@@ -12,6 +12,7 @@ import { sendTelegramTyping } from '../services/telegram.js';
 import { recordToolChain } from '../self-improvement/foundry.js';
 import { learnFromExecution } from '../self-improvement/learning-engine.js';
 import { checkToolPolicy } from '../security/tool-policies.js';
+import { getEnv } from '../config/env.js';
 import { query } from '../config/database.js';
 import { dashboardBus } from '../services/dashboard-events.js';
 import logger from '../utils/logger.js';
@@ -19,6 +20,36 @@ import { hookManager } from '../hooks/manager.js';
 import type { AgentContext, AgentResponse, ReasoningDepth, ToolContext, PendingAction, MessageChannel, ImageAttachment } from '../types/index.js';
 
 const MAX_TOOL_ITERATIONS = 10;
+
+/**
+ * Normalize user phone to a canonical ID so ALL channels share one conversation.
+ * WhatsApp uses raw phone, Telegram uses tg:chatId, Voice uses caller number.
+ * For JP (the only user), all map to JP_PHONE_NUMBER.
+ */
+export function normalizeUserPhone(phone: string, channel: MessageChannel): string {
+  const jpPhone = getEnv().JP_PHONE_NUMBER;
+
+  // Telegram: map JP's authorized chat ID to his phone number
+  if (channel === 'telegram') {
+    const chatId = phone.replace(/^tg:/, '');
+    const authorizedChat = getEnv().TELEGRAM_CHAT_ID;
+    if (chatId === authorizedChat) {
+      return jpPhone;
+    }
+  }
+
+  // Voice: match last 10 digits to identify JP
+  if (channel === 'voice') {
+    const cleaned = phone.replace(/\D/g, '');
+    const jpCleaned = jpPhone.replace(/\D/g, '');
+    if (cleaned.length >= 10 && jpCleaned.length >= 10 && cleaned.slice(-10) === jpCleaned.slice(-10)) {
+      return jpPhone;
+    }
+  }
+
+  // WhatsApp/Slack: already uses phone/identifier directly
+  return phone;
+}
 
 // Tool loop detection (inspired by OpenClaw's pattern)
 const toolCallHistory: Map<string, Array<{ hash: string; ts: number }>> = new Map();
@@ -94,15 +125,18 @@ export async function processMessage(phone: string, incomingMessage: string, cha
 async function _processMessageInner(phone: string, incomingMessage: string, channel: MessageChannel, images?: ImageAttachment[]): Promise<void> {
   const startTime = Date.now();
 
+  // Normalize user identity so ALL channels share one conversation
+  const conversationPhone = normalizeUserPhone(phone, channel);
+
   // Check for pending approval responses
-  const approvalResult = await checkApprovalResponse(phone, incomingMessage, channel);
+  const approvalResult = await checkApprovalResponse(conversationPhone, incomingMessage, channel);
   if (approvalResult) return;
 
   // Detect language
   const language = detectMessageLanguage(incomingMessage);
 
-  // Get or create conversation
-  const conversation = await getOrCreateConversation(phone, language);
+  // Get or create conversation (uses canonical phone — shared across channels)
+  const conversation = await getOrCreateConversation(conversationPhone, language);
 
   // Store incoming message
   await storeMessage(conversation.id, 'user', incomingMessage);
@@ -133,7 +167,7 @@ async function _processMessageInner(phone: string, incomingMessage: string, chan
   }
 
   // Get pending actions
-  const pendingActions = await getPendingActions(phone);
+  const pendingActions = await getPendingActions(conversationPhone);
 
   // Determine reasoning depth
   const depth = determineDepth(incomingMessage);
@@ -381,7 +415,7 @@ async function _processMessageInner(phone: string, incomingMessage: string, chan
 
 // ===== Helper Functions =====
 
-async function getOrCreateConversation(phone: string, language: string) {
+export async function getOrCreateConversation(phone: string, language: string) {
   // Try to get active conversation (within last 2 hours)
   const existing = await query(
     `SELECT * FROM conversations WHERE user_phone = $1 AND status = 'active'
@@ -399,14 +433,14 @@ async function getOrCreateConversation(phone: string, language: string) {
   return result.rows[0];
 }
 
-async function storeMessage(conversationId: string, role: string, content: string, toolName?: string, toolInput?: any) {
+export async function storeMessage(conversationId: string, role: string, content: string, toolName?: string, toolInput?: any) {
   await query(
     'INSERT INTO messages (conversation_id, role, content, tool_name, tool_input) VALUES ($1, $2, $3, $4, $5)',
     [conversationId, role, content, toolName || null, toolInput ? JSON.stringify(toolInput) : null]
   );
 }
 
-async function getRecentMessages(conversationId: string, limit: number = 20) {
+export async function getRecentMessages(conversationId: string, limit: number = 20) {
   const result = await query(
     `SELECT role, content, tool_name, tool_input FROM messages
      WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT $2`,
@@ -484,25 +518,25 @@ async function checkApprovalResponse(phone: string, message: string, channel: Me
   const action = result.rows[0];
 
   if (isApproval) {
-    // Execute the pending action
-    const registry = getToolRegistry();
-    const tool = registry.get(action.tool_name);
-    if (tool) {
-      const toolResult = await tool.execute(action.tool_input, {
+    // Execute the pending action through the full security pipeline (policy + hooks + retry)
+    const toolResult = await executeToolCall(
+      action.tool_name,
+      action.tool_input,
+      {
         conversationId: action.conversation_id,
         userPhone: phone,
         language: 'en',
         channel,
-      });
+      },
+    );
 
-      await query(
-        `UPDATE pending_actions SET status = 'executed', result = $1, resolved_at = NOW() WHERE id = $2`,
-        [JSON.stringify(toolResult), action.id]
-      );
+    await query(
+      `UPDATE pending_actions SET status = 'executed', result = $1, resolved_at = NOW() WHERE id = $2`,
+      [JSON.stringify(toolResult), action.id]
+    );
 
-      const confirmMsg = toolResult.success ? '✓ Done!' : `Failed: ${toolResult.error}`;
-      await respondToUser(phone, confirmMsg, undefined, channel);
-    }
+    const confirmMsg = toolResult.success ? '✓ Done!' : `Failed: ${toolResult.error}`;
+    await respondToUser(phone, confirmMsg, undefined, channel);
     return true;
   }
 
@@ -637,7 +671,7 @@ async function logToolUsage(toolName: string, success: boolean, durationMs: numb
  * 3. Ensure first message is from user
  * 4. Ensure alternating user/assistant pattern
  */
-function sanitizeMessages(messages: Anthropic.MessageParam[]): Anthropic.MessageParam[] {
+export function sanitizeMessages(messages: Anthropic.MessageParam[]): Anthropic.MessageParam[] {
   if (messages.length === 0) return messages;
 
   const cleaned: Anthropic.MessageParam[] = [];

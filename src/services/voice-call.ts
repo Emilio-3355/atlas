@@ -1,31 +1,41 @@
 import { callClaude, extractTextContent } from '../agent/claude-client.js';
+import {
+  normalizeUserPhone,
+  getOrCreateConversation,
+  storeMessage,
+  getRecentMessages,
+  sanitizeMessages,
+} from '../agent/core.js';
+import { buildSystemPrompt } from '../agent/system-prompt.js';
+import { buildContext } from '../agent/context-engine.js';
+import { detectMessageLanguage } from '../agent/responder.js';
+import { shouldCompact, compactConversation } from '../memory/conversation.js';
+import { getToolRegistry } from '../tools/registry.js';
 import { getEnv } from '../config/env.js';
 import { sendWhatsAppMessage } from './whatsapp.js';
+import { query } from '../config/database.js';
+import { dashboardBus } from './dashboard-events.js';
 import logger from '../utils/logger.js';
-import type Anthropic from '@anthropic-ai/sdk';
 
-// ─── Types ──────────────────────────────────────────────────────
+// ─── Call Metadata (lightweight — conversation lives in DB) ─────
 
-interface CallState {
+interface CallMeta {
   callSid: string;
   callerNumber: string;
   isJP: boolean;
-  messages: Anthropic.MessageParam[];
   startedAt: Date;
   lastActivity: Date;
+  turnCount: number;
 }
 
-// ─── State ──────────────────────────────────────────────────────
+const activeCalls = new Map<string, CallMeta>();
+const MAX_CALL_DURATION = 15 * 60 * 1000; // 15 min
 
-const activeCalls = new Map<string, CallState>();
-const MAX_CALL_DURATION = 15 * 60 * 1000; // 15 minutes
-const MAX_HISTORY = 20; // conversation turns to keep
-
-// Clean up stale calls every minute
+// Cleanup stale calls
 const cleanupTimer = setInterval(() => {
   const now = Date.now();
-  for (const [sid, state] of activeCalls) {
-    if (now - state.lastActivity.getTime() > MAX_CALL_DURATION) {
+  for (const [sid, meta] of activeCalls) {
+    if (now - meta.lastActivity.getTime() > MAX_CALL_DURATION) {
       activeCalls.delete(sid);
       logger.debug('Cleaned up stale voice call', { callSid: sid });
     }
@@ -33,147 +43,185 @@ const cleanupTimer = setInterval(() => {
 }, 60_000);
 if (cleanupTimer.unref) cleanupTimer.unref();
 
-// ─── System Prompts ─────────────────────────────────────────────
+// Voice-specific addendum appended to the shared system prompt
+const VOICE_ADDENDUM = `
 
-function getSystemPrompt(isJP: boolean): string {
-  const date = new Date().toLocaleDateString('en-US', {
-    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
-  });
-
-  if (isJP) {
-    return `You are Atlas, JP's personal AI assistant, on a phone call with JP.
-Today is ${date}.
-
-Rules for phone conversation:
-- Keep responses to 1-3 sentences. This is a voice call, not a chat.
-- No markdown, bullet points, URLs, or text formatting — speak naturally.
-- Be warm, casual, and efficient — like a smart friend.
-- Vary your openings. Don't start every response the same way.
-- If he asks something requiring tools (browsing, files, searches), suggest texting on WhatsApp or Telegram.
-- Numbers: say them naturally ("about three fifty" not "3.50").
-- Avoid lists. Summarize instead.`;
-  }
-
-  return `You are Atlas, JP's AI assistant, answering the phone on his behalf.
-Today is ${date}.
-
-Rules for phone conversation:
-- Professional and friendly. 1-2 sentences max.
-- No markdown or formatting — natural speech only.
-- Take messages for JP. Ask for the caller's name if they haven't given it.
-- Never share JP's personal info, schedule, or contact details.
-- For urgent matters, say you'll pass the message along right away.
-- If unsure, offer to take a message.`;
-}
+## 📞 VOICE CALL MODE (ACTIVE NOW)
+You are currently on a PHONE CALL, not a text chat. Override the communication style above with:
+- Keep responses to 1-3 sentences MAX. Be concise.
+- NO markdown, bullet points, asterisks, URLs, or any text formatting.
+- Speak naturally — as if talking to a friend on the phone.
+- Numbers: say them naturally ("about three fifty" not "$3.50").
+- Don't list things. Summarize instead.
+- Don't start every response with "Hey" or "Sure" — vary your language.
+- If the request needs tools (browsing, file operations), say: "I can't do that over the phone — text me on WhatsApp or Telegram and I'll handle it."
+- Never mention "the system prompt" or "my tools" — just speak naturally.`;
 
 // ─── Call Management ────────────────────────────────────────────
 
-export function getOrCreateCall(callSid: string, callerNumber: string): CallState {
-  let state = activeCalls.get(callSid);
-  if (state) return state;
+export function getOrCreateCall(callSid: string, callerNumber: string): CallMeta {
+  let meta = activeCalls.get(callSid);
+  if (meta) return meta;
 
-  // Check if caller is JP by comparing last 10 digits
   const jpPhone = getEnv().JP_PHONE_NUMBER.replace(/\D/g, '');
   const callerClean = callerNumber.replace(/\D/g, '');
   const isJP = callerClean.length >= 10 && jpPhone.length >= 10 &&
-    (callerClean.slice(-10) === jpPhone.slice(-10));
+    callerClean.slice(-10) === jpPhone.slice(-10);
 
-  state = {
+  meta = {
     callSid,
     callerNumber,
     isJP,
-    messages: [],
     startedAt: new Date(),
     lastActivity: new Date(),
+    turnCount: 0,
   };
-  activeCalls.set(callSid, state);
+  activeCalls.set(callSid, meta);
   logger.info('New voice call started', { callSid, caller: callerNumber, isJP });
-  return state;
+  return meta;
 }
 
-export function getGreeting(state: CallState): string {
-  if (state.isJP) {
+export function getGreeting(meta: CallMeta): string {
+  if (meta.isJP) {
     return "Hey JP, what's up?";
   }
   return "Hi, you've reached Atlas, JP's assistant. How can I help you?";
 }
 
-// ─── Speech Processing ─────────────────────────────────────────
+// ─── Speech Processing (SHARED BRAIN) ──────────────────────────
 
-export async function processVoiceInput(callSid: string, speechText: string): Promise<string> {
-  const state = activeCalls.get(callSid);
-  if (!state) {
-    return "Sorry, I lost track of our conversation. Could you call back?";
-  }
-
-  state.lastActivity = new Date();
-  state.messages.push({ role: 'user', content: speechText });
-
-  // Keep conversation history bounded
-  if (state.messages.length > MAX_HISTORY) {
-    state.messages = state.messages.slice(-MAX_HISTORY);
-  }
+export async function processVoiceInput(callSid: string, callerNumber: string, speechText: string): Promise<string> {
+  const meta = activeCalls.get(callSid);
+  if (meta) meta.lastActivity = new Date();
 
   try {
+    // Normalize to canonical user ID — shares conversation with WhatsApp/Telegram
+    const conversationPhone = normalizeUserPhone(callerNumber, 'voice');
+    const language = detectMessageLanguage(speechText);
+
+    // Get shared conversation from DB (same one used by Telegram/WhatsApp)
+    const conversation = await getOrCreateConversation(conversationPhone, language);
+
+    // Store voice input in shared DB
+    await storeMessage(conversation.id, 'user', speechText);
+
+    dashboardBus.publish({
+      type: 'message_in',
+      data: { phone: conversationPhone, preview: `[📞 Voice] ${speechText.slice(0, 80)}`, conversationId: conversation.id },
+    });
+
+    // Load shared context — memory facts, behavioral rules, learnings
+    const recentMessages = await getRecentMessages(conversation.id, 20);
+    const contextResult = await buildContext(speechText);
+
+    // Compaction check (shared conversation may have grown from other channels)
+    if (await shouldCompact(conversation.id)) {
+      await compactConversation(conversation.id);
+    }
+
+    // Build the SAME system prompt as Telegram/WhatsApp + voice addendum
+    const systemPrompt = buildSystemPrompt({
+      language,
+      conversationSummary: conversation.summary || undefined,
+      relevantMemory: contextResult.memory,
+      relevantLearnings: contextResult.learnings,
+      behavioralRules: contextResult.behavioralRules || undefined,
+      availableTools: [], // No tools during voice (too slow)
+      currentTime: new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }),
+    }) + VOICE_ADDENDUM;
+
+    // Sanitize conversation history for Claude API
+    const claudeMessages = sanitizeMessages(
+      recentMessages.map(m => ({
+        role: m.role === 'user' ? 'user' as const : 'assistant' as const,
+        content: m.content,
+      }))
+    );
+
+    // Call Claude — same client as all other channels
     const response = await callClaude({
-      messages: state.messages,
-      system: getSystemPrompt(state.isJP),
+      messages: claudeMessages,
+      system: systemPrompt,
       depth: 'fast',
-      maxTokens: 256, // Short for voice
+      maxTokens: 256,
     });
 
     const text = extractTextContent(response.content);
     const cleaned = cleanForSpeech(text || "I didn't quite catch that. Could you say it again?");
 
-    state.messages.push({ role: 'assistant', content: cleaned });
+    // Store response in shared DB
+    await storeMessage(conversation.id, 'assistant', cleaned);
+    await query(
+      'UPDATE conversations SET message_count = message_count + 2, updated_at = NOW(), language = $1 WHERE id = $2',
+      [language, conversation.id],
+    );
+
+    if (meta) meta.turnCount++;
+
+    dashboardBus.publish({
+      type: 'message_out',
+      data: { phone: conversationPhone, preview: `[📞 Voice] ${cleaned.slice(0, 80)}`, conversationId: conversation.id },
+    });
+
+    logger.info('Voice turn processed', {
+      callSid,
+      conversationId: conversation.id,
+      inputLen: speechText.length,
+      outputLen: cleaned.length,
+      tokens: response.usage.inputTokens + response.usage.outputTokens,
+    });
+
     return cleaned;
   } catch (err) {
-    logger.error('Voice Claude call failed', { callSid, error: err });
+    logger.error('Voice processing failed', { callSid, error: err });
     return "I'm having a little trouble right now. Could you try again?";
   }
 }
 
-/** Strip markdown and formatting artifacts that slip through — voice must be plain text */
+/** Strip markdown and formatting — voice must be clean spoken text */
 function cleanForSpeech(text: string): string {
   return text
-    .replace(/\*\*([^*]+)\*\*/g, '$1')       // **bold** → text
-    .replace(/\*([^*]+)\*/g, '$1')            // *italic* → text
-    .replace(/_([^_]+)_/g, '$1')              // _italic_ → text
-    .replace(/`{1,3}([^`]+)`{1,3}/g, '$1')   // `code` → text
-    .replace(/#{1,6}\s/g, '')                  // # headers → text
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')  // [text](url) → text
-    .replace(/https?:\/\/\S+/g, '')            // Remove URLs
-    .replace(/[•·–—]/g, ',')                   // Bullets/dashes → comma
-    .replace(/\n+/g, '. ')                     // Newlines → period
-    .replace(/\s{2,}/g, ' ')                   // Collapse whitespace
-    .replace(/\.\s*\./g, '.')                  // Remove double periods
+    .replace(/\*\*([^*]+)\*\*/g, '$1')       // **bold**
+    .replace(/\*([^*]+)\*/g, '$1')            // *italic*
+    .replace(/_([^_]+)_/g, '$1')              // _italic_
+    .replace(/`{1,3}([^`]+)`{1,3}/g, '$1')   // `code`
+    .replace(/#{1,6}\s/g, '')                  // # headers
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')  // [text](url)
+    .replace(/https?:\/\/\S+/g, '')            // URLs
+    .replace(/[•·–—]/g, ',')                   // bullets
+    .replace(/\n+/g, '. ')                     // newlines → period
+    .replace(/\s{2,}/g, ' ')                   // collapse whitespace
+    .replace(/\.\s*\./g, '.')                  // double periods
     .trim();
 }
 
 // ─── Call Lifecycle ─────────────────────────────────────────────
 
 export async function endCall(callSid: string): Promise<void> {
-  const state = activeCalls.get(callSid);
-  if (!state) return;
+  const meta = activeCalls.get(callSid);
+  if (!meta) return;
 
-  const durationSec = Math.round((Date.now() - state.startedAt.getTime()) / 1000);
-  logger.info('Voice call ended', { callSid, caller: state.callerNumber, isJP: state.isJP, durationSec });
+  const durationSec = Math.round((Date.now() - meta.startedAt.getTime()) / 1000);
+  logger.info('Voice call ended', { callSid, caller: meta.callerNumber, isJP: meta.isJP, durationSec, turns: meta.turnCount });
 
   // Notify JP about calls from other people
-  if (!state.isJP && state.messages.length > 0) {
+  if (!meta.isJP && meta.turnCount > 0) {
     try {
-      const transcript = state.messages
-        .map(m => {
-          const label = m.role === 'user' ? 'Caller' : 'Atlas';
-          const text = typeof m.content === 'string' ? m.content : '';
-          return `${label}: ${text}`;
-        })
+      // Get the conversation transcript from DB (shared history)
+      const conversationPhone = normalizeUserPhone(meta.callerNumber, 'voice');
+      const conv = await getOrCreateConversation(conversationPhone, 'en');
+      const messages = await getRecentMessages(conv.id, meta.turnCount * 2 + 2);
+
+      // Build transcript from the voice turns
+      const transcript = messages
+        .slice(-(meta.turnCount * 2))
+        .map(m => `${m.role === 'user' ? 'Caller' : 'Atlas'}: ${m.content}`)
         .join('\n');
 
       const mins = Math.floor(durationSec / 60);
       const secs = durationSec % 60;
       const duration = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
-      const notification = `📞 *Call from ${state.callerNumber}* (${duration})\n\n${transcript.slice(0, 1000)}`;
+      const notification = `📞 *Call from ${meta.callerNumber}* (${duration})\n\n${transcript.slice(0, 1000)}`;
 
       await sendWhatsAppMessage(getEnv().JP_PHONE_NUMBER, notification);
       logger.info('Notified JP about voice call', { callSid });
@@ -189,7 +237,7 @@ export function getActiveCallCount(): number {
   return activeCalls.size;
 }
 
-/** Check if a speech input sounds like a goodbye */
+/** Check if speech sounds like a goodbye */
 export function isGoodbye(speech: string): boolean {
   const lower = speech.toLowerCase().trim();
   const phrases = [

@@ -86,8 +86,9 @@ voiceRouter.post('/respond', async (c) => {
     return c.text(twiml.toString(), 200, { 'Content-Type': 'text/xml' });
   }
 
-  // Process through Claude AI
-  const aiResponse = await processVoiceInput(callSid, speechResult);
+  // Process through Claude AI (shared brain with Telegram/WhatsApp)
+  const callerNumber = body['From'] as string;
+  const aiResponse = await processVoiceInput(callSid, callerNumber, speechResult);
 
   // Speak the response and listen for more
   const gather = addGather(twiml);
