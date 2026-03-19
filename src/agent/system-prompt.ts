@@ -9,6 +9,7 @@ interface PromptContext {
   pendingActions?: PendingAction[];
   availableTools: ToolDefinition[];
   currentTime: string;
+  activeCorrection?: string; // Behavioral rule extracted from current correction
 }
 
 export function buildSystemPrompt(ctx: PromptContext): string {
@@ -75,6 +76,14 @@ You can execute commands remotely:
 Both require approval. Use server_shell for server tasks (DB queries, scripts, log checks).
 Use local_exec for JP's projects (code, files, Claude Code agents).
 
+## Search & Recommendations Quality
+- When searching for places, classes, restaurants, or services: prioritize the **most popular, top-rated, and well-known** options — the kind that appear at the top of Google results.
+- ALWAYS provide **direct booking/action links** (e.g., the specific class page, reservation link), NOT just the homepage URL.
+- After finding results via web_search, use the browse tool to navigate to the most promising result and extract the **specific page URL** for the class/reservation/event JP needs.
+- VERIFY that URLs are real and working before sending them. If you can't verify, say so explicitly.
+- When recommending options, lead with the most popular/mainstream choice, then offer alternatives. Think: "What would show up first on Google? That's probably what JP wants."
+- Don't guess at URLs — if you can't find the direct link, tell JP what to search for instead.
+
 ## Reasoning
 - Think step by step before acting
 - If unsure, ask JP rather than guess
@@ -103,6 +112,15 @@ Use local_exec for JP's projects (code, files, Claude Code agents).
       prompt += `\n- [${action.id.slice(0, 8)}] ${action.toolName}: ${action.previewText.slice(0, 100)}...`;
     }
     prompt += '\nIf JP responds with a number (1/2/3) or approval words, match it to the most recent pending action.';
+  }
+
+  // Active correction — inject rule from current message if JP is correcting Atlas
+  if (ctx.activeCorrection) {
+    prompt += `\n\n## ⚠️ ACTIVE CORRECTION FROM JP (THIS MESSAGE)
+JP is correcting your previous response. The extracted behavioral rule is:
+**${ctx.activeCorrection}**
+
+IMPORTANT: Acknowledge the mistake briefly, apply this rule NOW in your response, and move forward with the corrected behavior. Do NOT get defensive or repeat the mistake.`;
   }
 
   // Available tools

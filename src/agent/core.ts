@@ -12,11 +12,27 @@ import { recordToolChain } from '../self-improvement/foundry.js';
 import { query } from '../config/database.js';
 import { dashboardBus } from '../services/dashboard-events.js';
 import logger from '../utils/logger.js';
+import { hookManager } from '../hooks/manager.js';
 import type { AgentContext, AgentResponse, ReasoningDepth, ToolContext, PendingAction, MessageChannel } from '../types/index.js';
 
 const MAX_TOOL_ITERATIONS = 10;
 
 export async function processMessage(phone: string, incomingMessage: string, channel: MessageChannel = 'whatsapp'): Promise<void> {
+  try {
+    await _processMessageInner(phone, incomingMessage, channel);
+  } catch (err) {
+    logger.error('Unhandled error in processMessage', { error: err, phone, channel });
+    // Always send a fallback so the user isn't left hanging
+    const fallback = '⚠️ Something went wrong processing your message. Please try again.';
+    try {
+      await respondToUser(phone, fallback, undefined, channel);
+    } catch (sendErr) {
+      logger.error('Failed to send error fallback', { error: sendErr, phone });
+    }
+  }
+}
+
+async function _processMessageInner(phone: string, incomingMessage: string, channel: MessageChannel): Promise<void> {
   const startTime = Date.now();
 
   // Check for pending approval responses
@@ -35,11 +51,12 @@ export async function processMessage(phone: string, incomingMessage: string, cha
   // Dashboard event: message received
   dashboardBus.publish({ type: 'message_in', data: { phone, preview: incomingMessage.slice(0, 100), conversationId: conversation.id } });
 
-  // Auto-detect corrections and outdated knowledge
+  // Auto-detect corrections and outdated knowledge — extract behavioral rules
+  let correctionRule: string | null = null;
   const correctionSignal = detectCorrection(incomingMessage);
   if (correctionSignal) {
-    await handleCorrection(conversation.id, incomingMessage, correctionSignal);
-    logger.debug('Correction detected', { type: correctionSignal.type, confidence: correctionSignal.confidence });
+    correctionRule = await handleCorrection(conversation.id, incomingMessage, correctionSignal);
+    logger.debug('Correction detected', { type: correctionSignal.type, confidence: correctionSignal.confidence, ruleExtracted: !!correctionRule });
   }
 
   // Load recent messages for context
@@ -90,7 +107,7 @@ export async function processMessage(phone: string, incomingMessage: string, cha
   const registry = getToolRegistry();
   const availableTools = registry.getAll();
 
-  // Build system prompt
+  // Build system prompt (inject active correction rule if detected)
   const systemPrompt = buildSystemPrompt({
     language,
     conversationSummary: conversation.summary || undefined,
@@ -99,6 +116,7 @@ export async function processMessage(phone: string, incomingMessage: string, cha
     pendingActions,
     availableTools,
     currentTime: new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }),
+    activeCorrection: correctionRule || undefined,
   });
 
   // Build Claude tool schemas
@@ -397,10 +415,32 @@ async function executeToolCall(toolName: string, input: Record<string, any>, ctx
     };
   }
 
+  // Run pre-tool hooks (can block execution or modify input)
+  const hookCtx = { toolName, toolInput: input, ...ctx };
+  const preResult = await hookManager.runPreToolHooks(hookCtx);
+  if (!preResult.allowed) {
+    return { success: false, error: `Blocked by hook: ${preResult.reason || 'no reason'}` };
+  }
+
   try {
-    return await tool.execute(input, ctx);
+    let result = await tool.execute(preResult.input, ctx);
+
+    // Run post-tool hooks (can modify result)
+    result = await hookManager.runPostToolHooks(hookCtx, result);
+
+    return result;
   } catch (err) {
     logger.error('Tool execution error', { tool: toolName, error: err });
+
+    // Run on-error hooks (can trigger retry)
+    const errorResult = await hookManager.runOnErrorHooks(
+      err instanceof Error ? err : new Error(String(err)),
+      hookCtx,
+    );
+    if (errorResult.fallback) {
+      return { success: true, data: errorResult.fallback };
+    }
+
     return { success: false, error: err instanceof Error ? err.message : String(err) };
   }
 }

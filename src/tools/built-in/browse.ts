@@ -21,8 +21,21 @@ export const browseTool: ToolDefinition = {
 
   async execute(input: { url: string; waitMs?: number }, ctx: ToolContext): Promise<ToolResult> {
     try {
-      const { page, content } = await loadPage(input.url, input.waitMs);
+      const { page, content, links, status } = await loadPage(input.url, input.waitMs);
       await page.close();
+
+      // Report non-200 status
+      if (status >= 400) {
+        return {
+          success: true,
+          data: {
+            content: `Page returned HTTP ${status} (${status === 404 ? 'Not Found' : 'Error'})`,
+            url: input.url,
+            status,
+            links: [],
+          },
+        };
+      }
 
       // Check for injection attempts
       const injection = detectInjection(content);
@@ -34,16 +47,26 @@ export const browseTool: ToolDefinition = {
             content: tagContent(content, 'hostile', input.url),
             warning: `⚠️ Potential prompt injection detected in page content. Patterns: ${injection.patterns.join(', ')}`,
             url: input.url,
+            status,
+            links,
           },
         };
       }
+
+      // Format links for Claude
+      const linksSummary = links.length > 0
+        ? links.slice(0, 20).map(l => `  - "${l.text}" → ${l.url}`).join('\n')
+        : '  (no links found)';
 
       return {
         success: true,
         data: {
           content: tagContent(content, 'untrusted', input.url),
           url: input.url,
+          status,
           length: content.length,
+          links,
+          linksSummary: `\nPage links:\n${linksSummary}`,
         },
       };
     } catch (err) {

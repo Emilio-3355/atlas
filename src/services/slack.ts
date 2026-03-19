@@ -99,13 +99,13 @@ export async function sendSlackImage(
 /**
  * Verify a Slack request signature.
  */
-export function verifySlackSignature(
+export async function verifySlackSignature(
   signingSecret: string,
   requestTimestamp: string,
   requestBody: string,
   signature: string,
-): boolean {
-  const crypto = require('crypto');
+): Promise<boolean> {
+  const crypto = await import('crypto');
   const baseString = `v0:${requestTimestamp}:${requestBody}`;
   const hmac = crypto.createHmac('sha256', signingSecret).update(baseString).digest('hex');
   const computed = `v0=${hmac}`;

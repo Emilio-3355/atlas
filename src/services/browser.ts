@@ -28,27 +28,57 @@ export async function createPage(): Promise<Page> {
   return context.newPage();
 }
 
-export async function loadPage(url: string, waitMs: number = 3000): Promise<{ page: Page; content: string }> {
+export interface PageLink {
+  text: string;
+  url: string;
+}
+
+export interface LoadPageResult {
+  page: Page;
+  content: string;
+  links: PageLink[];
+  status: number;
+}
+
+export async function loadPage(url: string, waitMs: number = 3000): Promise<LoadPageResult> {
   const page = await createPage();
 
   try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    const status = response?.status() ?? 0;
     await page.waitForTimeout(waitMs);
 
-    // Extract readable text (runs in browser context)
-    const content = await page.evaluate(`
+    // Extract readable text AND links (runs in browser context)
+    const extracted = await page.evaluate(`
       (() => {
+        // Extract links BEFORE removing nav/footer (they contain useful navigation links)
+        const links = [];
+        const seen = new Set();
+        document.querySelectorAll('a[href]').forEach(a => {
+          const href = a.getAttribute('href') || '';
+          const text = (a.textContent || '').trim().slice(0, 100);
+          if (!href || !text || text.length < 2) return;
+          // Resolve relative URLs
+          let fullUrl;
+          try { fullUrl = new URL(href, document.location.href).href; } catch { return; }
+          if (seen.has(fullUrl)) return;
+          if (fullUrl.startsWith('javascript:') || fullUrl.startsWith('mailto:') || fullUrl.startsWith('#')) return;
+          seen.add(fullUrl);
+          links.push({ text, url: fullUrl });
+        });
+
+        // Now strip non-content elements for text extraction
         const removeSelectors = ['script', 'style', 'nav', 'footer', 'header', 'iframe', 'noscript'];
         for (const sel of removeSelectors) {
           document.querySelectorAll(sel).forEach(el => el.remove());
         }
         const body = document.body;
-        if (!body) return '';
-        return body.innerText.replace(/\\n{3,}/g, '\\n\\n').trim().slice(0, 10000);
+        const content = body ? body.innerText.replace(/\\n{3,}/g, '\\n\\n').trim().slice(0, 10000) : '';
+        return { content, links: links.slice(0, 50) };
       })()
-    `) as string;
+    `) as { content: string; links: PageLink[] };
 
-    return { page, content };
+    return { page, content: extracted.content, links: extracted.links, status };
   } catch (err) {
     await page.close();
     throw err;

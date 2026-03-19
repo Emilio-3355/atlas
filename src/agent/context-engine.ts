@@ -1,4 +1,4 @@
-import { getAllFacts, searchFacts } from '../memory/structured.js';
+import { getAllFacts, searchFacts, getFactsByCategory } from '../memory/structured.js';
 import { hybridSearch } from '../memory/semantic.js';
 import { findRelevantLearnings } from '../memory/learnings.js';
 import logger from '../utils/logger.js';
@@ -11,18 +11,29 @@ interface ContextResult {
 }
 
 export async function buildContext(userMessage: string): Promise<ContextResult> {
-  const [structuredFacts, semanticResults, learnings] = await Promise.allSettled([
+  const [structuredFacts, semanticResults, learnings, behavioralRules] = await Promise.allSettled([
     searchFacts(userMessage, 5),
     hybridSearch(userMessage, 5),
     findRelevantLearnings(userMessage, 3),
+    getFactsByCategory('behavioral_rule'), // Always load ALL behavioral rules
   ]);
 
   let memory = '';
 
+  // Behavioral rules — always included, these are critical corrections from JP
+  if (behavioralRules.status === 'fulfilled' && behavioralRules.value.length > 0) {
+    memory += '*Behavioral Rules (from JP corrections — ALWAYS follow these):*\n';
+    for (const rule of behavioralRules.value) {
+      memory += `• ${rule.value}\n`;
+    }
+  }
+
   // Structured facts
   if (structuredFacts.status === 'fulfilled' && structuredFacts.value.length > 0) {
-    memory += '*Known Facts:*\n';
+    memory += '\n*Known Facts:*\n';
     for (const fact of structuredFacts.value) {
+      // Skip behavioral rules here (already shown above)
+      if (fact.category === 'behavioral_rule') continue;
       memory += `• [${fact.category}] ${fact.key}: ${fact.value}\n`;
     }
   }

@@ -37,10 +37,19 @@ async function braveSearch(query: string, count: number): Promise<SearchResult[]
 }
 
 /** Fallback: search via Google using Playwright headless browser */
-async function browserSearch(query: string, count: number): Promise<SearchResult[]> {
-  const url = `https://www.google.com/search?q=${encodeURIComponent(query)}&num=${count}&hl=en`;
+async function browserSearch(searchQuery: string, count: number): Promise<SearchResult[]> {
+  const url = `https://www.google.com/search?q=${encodeURIComponent(searchQuery)}&num=${count}&hl=en`;
 
-  const { page, content } = await loadPage(url, 2000);
+  const result = await loadPage(url, 2000);
+  const { page, content } = result;
+
+  // Detect CAPTCHA / blocking
+  const isCaptcha = content.includes('unusual traffic') || content.includes('reCAPTCHA') || content.includes('not a robot');
+  if (isCaptcha) {
+    await page.close();
+    logger.warn('Google CAPTCHA detected', { query: searchQuery });
+    return [];
+  }
 
   // Extract structured results from the page (runs in browser context)
   const results = await page.evaluate(`
@@ -82,6 +91,24 @@ async function browserSearch(query: string, count: number): Promise<SearchResult
   return results;
 }
 
+/** Quick HEAD request to verify a URL is reachable (not 404/5xx) */
+async function verifyUrl(url: string): Promise<{ ok: boolean; status: number }> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3000);
+    const response = await fetch(url, {
+      method: 'HEAD',
+      signal: controller.signal,
+      redirect: 'follow',
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Atlas/1.0)' },
+    });
+    clearTimeout(timeout);
+    return { ok: response.ok, status: response.status };
+  } catch {
+    return { ok: false, status: 0 };
+  }
+}
+
 export const webSearchTool: ToolDefinition = {
   name: 'web_search',
   description: 'Search the web for current information. Returns titles, URLs, and snippets. Use for finding restaurants, events, prices, news, etc.',
@@ -104,22 +131,44 @@ export const webSearchTool: ToolDefinition = {
     try {
       // Try Brave first (if key available)
       let results = await braveSearch(input.query, count);
+      let searchEngine = 'brave';
 
       // Fallback to browser-based Google search
       if (results.length === 0) {
         logger.info('Brave unavailable, falling back to browser search', { query: input.query });
         results = await browserSearch(input.query, count);
+        searchEngine = 'google';
       }
 
       if (results.length === 0) {
-        return { success: true, data: { results: [], formatted: 'No results found.', count: 0 } };
+        return {
+          success: true,
+          data: {
+            results: [],
+            formatted: searchEngine === 'google'
+              ? 'No results found. Google may be blocking automated searches — try a more specific query or use the browse tool directly on a known URL.'
+              : 'No results found.',
+            count: 0,
+          },
+        };
       }
 
-      const formatted = results.map((r) =>
-        `• *${r.title}*\n  ${r.url}\n  ${tagContent(r.description, 'untrusted', 'web_search')}`
-      ).join('\n\n');
+      // Verify top URLs in parallel (max 3 to keep it fast)
+      const verifications = await Promise.all(
+        results.slice(0, 3).map(async (r) => {
+          const check = await verifyUrl(r.url);
+          return { url: r.url, ...check };
+        })
+      );
 
-      return { success: true, data: { results, formatted, count: results.length } };
+      const deadUrls = new Set(verifications.filter(v => !v.ok).map(v => v.url));
+
+      const formatted = results.map((r) => {
+        const dead = deadUrls.has(r.url) ? ' ⚠️ URL may be broken' : '';
+        return `• *${r.title}*${dead}\n  ${r.url}\n  ${tagContent(r.description, 'untrusted', 'web_search')}`;
+      }).join('\n\n');
+
+      return { success: true, data: { results, formatted, count: results.length, deadUrls: [...deadUrls] } };
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       logger.error('Web search error', { error: errMsg, query: input.query });
