@@ -28,32 +28,33 @@ export function validateTwilioSignature(url: string, params: Record<string, stri
   return crypto.timingSafeEqual(sigBuffer, expectedBuffer);
 }
 
-export async function twilioWebhookMiddleware(c: Context, next: Next) {
-  // Skip validation in development
-  if (getEnv().NODE_ENV === 'development') {
-    return next();
-  }
+/** Create a Twilio signature validator for any webhook path */
+export function createTwilioValidator(webhookPath: string) {
+  return async (c: Context, next: Next) => {
+    if (getEnv().NODE_ENV === 'development') return next();
 
-  const signature = c.req.header('x-twilio-signature');
-  if (!signature) {
-    logger.warn('Missing Twilio signature');
-    return c.text('Unauthorized', 401);
-  }
-
-  const body = await c.req.parseBody();
-  const url = getEnv().BASE_URL + '/webhook/whatsapp';
-
-  const params: Record<string, string> = {};
-  for (const [key, value] of Object.entries(body)) {
-    if (typeof value === 'string') {
-      params[key] = value;
+    const signature = c.req.header('x-twilio-signature');
+    if (!signature) {
+      logger.warn('Missing Twilio signature', { path: webhookPath });
+      return c.text('Unauthorized', 401);
     }
-  }
 
-  if (!validateTwilioSignature(url, params, signature)) {
-    logger.warn('Invalid Twilio signature');
-    return c.text('Unauthorized', 401);
-  }
+    const body = await c.req.parseBody();
+    const url = getEnv().BASE_URL + webhookPath;
 
-  return next();
+    const params: Record<string, string> = {};
+    for (const [key, value] of Object.entries(body)) {
+      if (typeof value === 'string') params[key] = value;
+    }
+
+    if (!validateTwilioSignature(url, params, signature)) {
+      logger.warn('Invalid Twilio signature', { path: webhookPath });
+      return c.text('Unauthorized', 401);
+    }
+
+    return next();
+  };
 }
+
+// Backward-compatible: WhatsApp webhook validator
+export const twilioWebhookMiddleware = createTwilioValidator('/webhook/whatsapp');

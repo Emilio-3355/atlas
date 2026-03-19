@@ -11,6 +11,7 @@ import telegramRouter from './routes/telegram.js';
 import slackRouter from './routes/slack.js';
 import healthRouter from './routes/health.js';
 import gmailCallbackRouter from './routes/gmail-callback.js';
+import voiceRouter from './routes/voice.js';
 import logger from './utils/logger.js';
 import { initDaemonBridge, closeDaemonBridge } from './services/daemon-bridge.js';
 import dashboardRouter from './routes/dashboard-api.js';
@@ -40,15 +41,8 @@ app.route('/health', healthRouter);
 app.route('/auth/google/callback', gmailCallbackRouter);
 app.route('/control', dashboardRouter);
 
-// Voice call forwarding — forwards incoming calls to JP's phone
-app.post('/voice/forward', (c) => {
-  const jpPhone = getEnv().JP_PHONE_NUMBER;
-  return c.text(
-    `<?xml version="1.0" encoding="UTF-8"?><Response><Dial>${jpPhone}</Dial></Response>`,
-    200,
-    { 'Content-Type': 'text/xml' },
-  );
-});
+// Voice AI — Atlas answers calls and talks via Claude
+app.route('/voice', voiceRouter);
 
 // Serve voice files temporarily (for Twilio media)
 app.get('/media/voice/:filename', async (c) => {
