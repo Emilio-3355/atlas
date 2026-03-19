@@ -9,6 +9,7 @@ import { analyzeActivityPatterns } from './adaptive.js';
 import { promoteLearnings } from '../self-improvement/promoter.js';
 import { detectStaleness } from '../self-improvement/staleness-detector.js';
 import { runFoundryAnalysis } from '../self-improvement/foundry.js';
+import { crystallize } from '../self-improvement/crystallizer.js';
 import { checkPriceAlerts, checkSecFilings } from './finance-monitor.js';
 import { dashboardBus } from '../services/dashboard-events.js';
 import logger from '../utils/logger.js';
@@ -83,6 +84,7 @@ export function startScheduler(): void {
         await promoteLearnings();
         await detectStaleness();
         await runFoundryAnalysis();
+        await crystallize();
         dashboardBus.publish({ type: 'cron_fired', data: { job: 'Patterns' } });
       } catch (err) {
         logger.error('Pattern analysis failed', { error: err });

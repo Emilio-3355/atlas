@@ -9,6 +9,7 @@ import { shouldCompact, compactConversation } from '../memory/conversation.js';
 import { detectCorrection, handleCorrection } from '../self-improvement/correction-detector.js';
 import { detectStaleness, handleStalenessFromToolResult } from '../self-improvement/staleness-detector.js';
 import { recordToolChain } from '../self-improvement/foundry.js';
+import { learnFromExecution } from '../self-improvement/learning-engine.js';
 import { query } from '../config/database.js';
 import { dashboardBus } from '../services/dashboard-events.js';
 import logger from '../utils/logger.js';
@@ -16,6 +17,62 @@ import { hookManager } from '../hooks/manager.js';
 import type { AgentContext, AgentResponse, ReasoningDepth, ToolContext, PendingAction, MessageChannel, ImageAttachment } from '../types/index.js';
 
 const MAX_TOOL_ITERATIONS = 10;
+
+// Tool loop detection (inspired by OpenClaw's pattern)
+const toolCallHistory: Map<string, Array<{ hash: string; ts: number }>> = new Map();
+
+function hashToolCall(toolName: string, input: Record<string, any>): string {
+  const sortedInput = JSON.stringify(input, Object.keys(input).sort());
+  // Simple hash — good enough for loop detection
+  let hash = 0;
+  const str = `${toolName}:${sortedInput}`;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
+  }
+  return String(hash);
+}
+
+function detectToolLoop(conversationId: string, toolName: string, input: Record<string, any>): { stuck: boolean; count: number } {
+  const key = conversationId;
+  const hash = hashToolCall(toolName, input);
+
+  if (!toolCallHistory.has(key)) toolCallHistory.set(key, []);
+  const history = toolCallHistory.get(key)!;
+  history.push({ hash, ts: Date.now() });
+
+  // Keep last 30 entries
+  if (history.length > 30) history.splice(0, history.length - 30);
+
+  const identicalCount = history.filter(h => h.hash === hash).length;
+  return { stuck: identicalCount >= 3, count: identicalCount };
+}
+
+function clearToolLoopHistory(conversationId: string) {
+  toolCallHistory.delete(conversationId);
+}
+
+/** Truncate large tool results to prevent context overflow */
+function truncateToolResult(text: string, maxChars: number = 30000): string {
+  if (text.length <= maxChars) return text;
+
+  const suffix = '\n\n[... content truncated ...]';
+  const budget = maxChars - suffix.length;
+
+  // Check if tail has important content (errors, JSON closing, summary)
+  const tail = text.slice(-2000);
+  const hasImportantTail = /\b(error|failed|summary|total|result)\b/i.test(tail);
+
+  if (hasImportantTail && budget > 4000) {
+    const tailBudget = Math.min(Math.floor(budget * 0.3), 4000);
+    const headBudget = budget - tailBudget;
+    const headCut = text.lastIndexOf('\n', headBudget) || headBudget;
+    const tailStart = Math.max(0, text.length - tailBudget);
+    return text.slice(0, headCut) + '\n\n[... middle content omitted ...]\n\n' + text.slice(tailStart);
+  }
+
+  const cut = text.lastIndexOf('\n', budget) || budget;
+  return text.slice(0, cut) + suffix;
+}
 
 export async function processMessage(phone: string, incomingMessage: string, channel: MessageChannel = 'whatsapp', images?: ImageAttachment[]): Promise<void> {
   try {
@@ -183,6 +240,17 @@ async function _processMessageInner(phone: string, incomingMessage: string, chan
       const toolResults: Array<{ id: string; result: any }> = [];
 
       for (const toolUseBlock of allToolUseBlocks) {
+        // Tool loop detection — prevent infinite cycles
+        const loopCheck = detectToolLoop(conversation.id, toolUseBlock.name, toolUseBlock.input as Record<string, any>);
+        if (loopCheck.stuck) {
+          logger.warn('Tool loop detected — same call repeated 3+ times', { tool: toolUseBlock.name, count: loopCheck.count });
+          toolResults.push({
+            id: toolUseBlock.id,
+            result: { success: false, error: `Tool loop detected: ${toolUseBlock.name} has been called ${loopCheck.count} times with identical arguments. Try a completely different approach or tool.` },
+          });
+          continue;
+        }
+
         dashboardBus.publish({ type: 'tool_call', data: { tool: toolUseBlock.name, input: toolUseBlock.input } });
         toolsUsed.push(toolUseBlock.name);
 
@@ -217,7 +285,7 @@ async function _processMessageInner(phone: string, incomingMessage: string, chan
         });
       }
 
-      // Add assistant response (with all tool_use blocks) and ALL tool_results
+      // Add assistant response (with all tool_use blocks) and ALL tool_results (truncated)
       currentMessages.push({
         role: 'assistant',
         content: response.content,
@@ -227,7 +295,7 @@ async function _processMessageInner(phone: string, incomingMessage: string, chan
         content: toolResults.map((tr) => ({
           type: 'tool_result' as const,
           tool_use_id: tr.id,
-          content: JSON.stringify(tr.result.data || tr.result.error || 'Done'),
+          content: truncateToolResult(JSON.stringify(tr.result.data || tr.result.error || 'Done')),
         })),
       });
 
@@ -263,6 +331,9 @@ async function _processMessageInner(phone: string, incomingMessage: string, chan
         durationMs: Date.now() - startTime,
         tokensUsed: response.usage.inputTokens + response.usage.outputTokens,
       });
+
+      // Clean up tool loop history for this conversation
+      clearToolLoopHistory(conversation.id);
 
       // Foundry: record multi-tool chains for crystallization analysis
       if (toolsUsed.length >= 2) {
@@ -461,9 +532,17 @@ async function executeToolCall(toolName: string, input: Record<string, any>, ctx
     // Run post-tool hooks (can modify result)
     result = await hookManager.runPostToolHooks(hookCtx, result);
 
+    // Learn from failures (non-blocking)
+    if (!result.success) {
+      learnFromExecution(toolName, input, false, result.error).catch(() => {});
+    }
+
     return result;
   } catch (err) {
     logger.error('Tool execution error', { tool: toolName, error: err });
+
+    // Learn from exceptions (non-blocking)
+    learnFromExecution(toolName, input, false, err instanceof Error ? err.message : String(err)).catch(() => {});
 
     // Run on-error hooks (can trigger retry)
     const errorResult = await hookManager.runOnErrorHooks(

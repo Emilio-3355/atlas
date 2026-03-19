@@ -36,6 +36,51 @@ async function braveSearch(query: string, count: number): Promise<SearchResult[]
   }));
 }
 
+/** Fallback: search via DuckDuckGo HTML (no API key needed, no CAPTCHA) */
+async function duckDuckGoSearch(searchQuery: string, count: number): Promise<SearchResult[]> {
+  try {
+    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(searchQuery)}`;
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      },
+    });
+    if (!response.ok) return [];
+
+    const html = await response.text();
+    const results: SearchResult[] = [];
+
+    // Parse DDG HTML results — each result is in a <div class="result">
+    const resultBlocks = html.split('<div class="result ');
+    for (let i = 1; i < resultBlocks.length && results.length < count; i++) {
+      const block = resultBlocks[i];
+      // Extract URL from <a class="result__a" href="...">
+      const urlMatch = block.match(/href="([^"]+)"/);
+      const titleMatch = block.match(/class="result__a"[^>]*>([^<]+)/);
+      const descMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/);
+
+      if (urlMatch && titleMatch) {
+        let href = urlMatch[1];
+        // DDG uses redirect URLs — extract actual URL
+        if (href.includes('uddg=')) {
+          const uddg = new URL(href, 'https://duckduckgo.com').searchParams.get('uddg');
+          if (uddg) href = uddg;
+        }
+        results.push({
+          title: titleMatch[1].trim(),
+          url: href,
+          description: descMatch ? descMatch[1].replace(/<[^>]+>/g, '').trim().slice(0, 200) : '',
+        });
+      }
+    }
+
+    return results;
+  } catch (err) {
+    logger.warn('DuckDuckGo search failed', { error: err, query: searchQuery });
+    return [];
+  }
+}
+
 /** Fallback: search via Google using Playwright headless browser */
 async function browserSearch(searchQuery: string, count: number): Promise<SearchResult[]> {
   const url = `https://www.google.com/search?q=${encodeURIComponent(searchQuery)}&num=${count}&hl=en`;
@@ -133,23 +178,25 @@ export const webSearchTool: ToolDefinition = {
       let results = await braveSearch(input.query, count);
       let searchEngine = 'brave';
 
+      // Fallback to DuckDuckGo (no API key, no CAPTCHA)
+      if (results.length === 0) {
+        logger.info('Brave unavailable, trying DuckDuckGo', { query: input.query });
+        results = await duckDuckGoSearch(input.query, count);
+        searchEngine = 'duckduckgo';
+      }
+
       // Fallback to browser-based Google search
       if (results.length === 0) {
-        logger.info('Brave unavailable, falling back to browser search', { query: input.query });
+        logger.info('DuckDuckGo unavailable, falling back to browser Google search', { query: input.query });
         results = await browserSearch(input.query, count);
         searchEngine = 'google';
       }
 
       if (results.length === 0) {
+        // Return as FAILURE so the agent knows to try a different approach
         return {
-          success: true,
-          data: {
-            results: [],
-            formatted: searchEngine === 'google'
-              ? 'No results found. Google may be blocking automated searches — try a more specific query or use the browse tool directly on a known URL.'
-              : 'No results found.',
-            count: 0,
-          },
+          success: false,
+          error: 'All search engines failed (Brave unavailable, DuckDuckGo returned no results, Google blocked by CAPTCHA). Try using the browse tool directly on a known URL like Google Maps, Yelp, or the business website. Do NOT tell the user to search themselves.',
         };
       }
 

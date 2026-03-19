@@ -18,9 +18,14 @@ import { initDashboardWS, closeDashboardWS } from './services/dashboard-ws.js';
 import { isTelegramEnabled, getTelegramBot } from './services/telegram.js';
 import { messageQueue } from './agent/message-queue.js';
 import { processMessage } from './agent/core.js';
+import { hookManager } from './hooks/manager.js';
+import { smartErrorHandler } from './hooks/on-error.js';
 
 // Wire up the message processing handler (central, not hidden in a route file)
 messageQueue.setHandler(processMessage);
+
+// Register hooks (error handling, learning from failures)
+hookManager.registerOnError(smartErrorHandler);
 
 const app = new Hono();
 
