@@ -8,8 +8,10 @@ import { getToolRegistry } from '../tools/registry.js';
 import { shouldCompact, compactConversation } from '../memory/conversation.js';
 import { detectCorrection, handleCorrection } from '../self-improvement/correction-detector.js';
 import { detectStaleness, handleStalenessFromToolResult } from '../self-improvement/staleness-detector.js';
+import { sendTelegramTyping } from '../services/telegram.js';
 import { recordToolChain } from '../self-improvement/foundry.js';
 import { learnFromExecution } from '../self-improvement/learning-engine.js';
+import { checkToolPolicy } from '../security/tool-policies.js';
 import { query } from '../config/database.js';
 import { dashboardBus } from '../services/dashboard-events.js';
 import logger from '../utils/logger.js';
@@ -225,6 +227,11 @@ async function _processMessageInner(phone: string, incomingMessage: string, chan
   while (iterations < MAX_TOOL_ITERATIONS) {
     iterations++;
 
+    // Send typing indicator so user knows Atlas is working
+    if (channel === 'telegram') {
+      sendTelegramTyping(phone.replace(/^tg:/, '')).catch(() => {});
+    }
+
     const response = await callClaude({
       messages: currentMessages,
       system: systemPrompt,
@@ -253,6 +260,11 @@ async function _processMessageInner(phone: string, incomingMessage: string, chan
 
         dashboardBus.publish({ type: 'tool_call', data: { tool: toolUseBlock.name, input: toolUseBlock.input } });
         toolsUsed.push(toolUseBlock.name);
+
+        // Refresh typing indicator before tool execution (tools can take 30+ seconds)
+        if (channel === 'telegram') {
+          sendTelegramTyping(phone.replace(/^tg:/, '')).catch(() => {});
+        }
 
         const toolCallStart = Date.now();
         const toolResult = await executeToolCall(
@@ -298,6 +310,14 @@ async function _processMessageInner(phone: string, incomingMessage: string, chan
           content: truncateToolResult(JSON.stringify(tr.result.data || tr.result.error || 'Done')),
         })),
       });
+
+      // Play-by-play: send brief status on 3rd+ tool iteration so user knows Atlas is working
+      if (iterations === 3 && toolsUsed.length >= 3) {
+        const statusMsg = language === 'es'
+          ? `🔍 Trabajando en esto... (${toolsUsed.length} pasos completados)`
+          : `🔍 Working on it... (${toolsUsed.length} steps done)`;
+        respondToUser(phone, statusMsg, language, channel).catch(() => {});
+      }
 
       // Auto-escalate if tool chain is getting long
       if (iterations >= 5 && currentDepth === 'fast') {
@@ -508,6 +528,13 @@ async function executeToolCall(toolName: string, input: Record<string, any>, ctx
 
   if (!tool.enabled) {
     return { success: false, error: `Tool ${toolName} is disabled` };
+  }
+
+  // Security policy check (NemoClaw-inspired deny-by-default)
+  const policyCheck = checkToolPolicy(toolName, input);
+  if (!policyCheck.allowed) {
+    logger.warn('Tool blocked by policy', { tool: toolName, reason: policyCheck.reason });
+    return { success: false, error: policyCheck.reason || 'Blocked by security policy' };
   }
 
   // If tool requires approval, don't execute — return approval preview

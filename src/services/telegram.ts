@@ -24,26 +24,64 @@ export function getAuthorizedChatId(): string {
   return getEnv().TELEGRAM_CHAT_ID;
 }
 
+/** Send "typing..." indicator to a Telegram chat */
+export async function sendTelegramTyping(chatId: string | number): Promise<void> {
+  const b = getTelegramBot();
+  if (!b) return;
+  try {
+    await b.api.sendChatAction(chatId, 'typing');
+  } catch {
+    // Non-critical — don't fail if typing indicator fails
+  }
+}
+
+/** Split text into chunks respecting Telegram's 4096 char limit */
+function chunkText(text: string, maxLen: number = 4000): string[] {
+  if (text.length <= maxLen) return [text];
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLen) {
+      chunks.push(remaining);
+      break;
+    }
+    // Try to break at newline
+    let cut = remaining.lastIndexOf('\n', maxLen);
+    if (cut < maxLen * 0.5) cut = maxLen; // No good newline found
+    chunks.push(remaining.slice(0, cut));
+    remaining = remaining.slice(cut).trimStart();
+  }
+  return chunks;
+}
+
 export async function sendTelegramMessage(chatId: string | number, text: string): Promise<number> {
   const b = getTelegramBot();
   if (!b) throw new Error('Telegram bot not initialized');
 
-  try {
-    // Convert WhatsApp formatting to Telegram MarkdownV2
-    const formatted = formatForTelegram(text);
-    const msg = await b.api.sendMessage(chatId, formatted, { parse_mode: 'HTML' });
-    logger.debug('Telegram message sent', { chatId, messageId: msg.message_id });
-    return msg.message_id;
-  } catch (err) {
-    // Fallback: send as plain text if formatting fails
+  const chunks = chunkText(text);
+  let lastMsgId = 0;
+
+  for (const chunk of chunks) {
     try {
-      const msg = await b.api.sendMessage(chatId, text);
-      return msg.message_id;
-    } catch (fallbackErr) {
-      logger.error('Failed to send Telegram message', { error: fallbackErr, chatId });
-      throw fallbackErr;
+      const formatted = formatForTelegram(chunk);
+      const msg = await b.api.sendMessage(chatId, formatted, { parse_mode: 'HTML' });
+      lastMsgId = msg.message_id;
+    } catch {
+      // Fallback: send as plain text if formatting fails
+      try {
+        const msg = await b.api.sendMessage(chatId, chunk);
+        lastMsgId = msg.message_id;
+      } catch (fallbackErr) {
+        logger.error('Failed to send Telegram message', { error: fallbackErr, chatId });
+        throw fallbackErr;
+      }
     }
+    // Small delay between chunks
+    if (chunks.length > 1) await new Promise(r => setTimeout(r, 300));
   }
+
+  logger.debug('Telegram message sent', { chatId, messageId: lastMsgId, chunks: chunks.length });
+  return lastMsgId;
 }
 
 export async function sendTelegramImage(chatId: string | number, imageUrl: string, caption?: string): Promise<number> {
