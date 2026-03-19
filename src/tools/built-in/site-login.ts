@@ -191,8 +191,13 @@ export const siteLoginTool: ToolDefinition = {
 
         try {
           // Navigate to login page
-          await page.goto(config.loginUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-          await page.waitForTimeout(1000);
+          logger.info('Navigating to login page', { site: siteId, url: config.loginUrl });
+          await page.goto(config.loginUrl, { waitUntil: 'networkidle', timeout: 20000 });
+
+          // Wait for the login form to appear (handles JS-rendered pages)
+          logger.info('Waiting for login form fields...');
+          await page.waitForSelector(config.usernameSelector, { state: 'visible', timeout: 15000 });
+          await page.waitForSelector(config.passwordSelector, { state: 'visible', timeout: 10000 });
 
           // Fill credentials
           await page.fill(config.usernameSelector, creds.username);
