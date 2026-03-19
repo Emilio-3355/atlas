@@ -3,9 +3,14 @@ import logger from '../utils/logger.js';
 
 let browser: Browser | null = null;
 let consecutiveFailures = 0;
+let activePages = 0;
 const MAX_CONSECUTIVE_FAILURES = 5;
+const MAX_CONCURRENT_PAGES = 3;   // Prevent OOM from too many pages
 const PAGE_TIMEOUT = 45_000;      // 45s for page navigation
 const SCREENSHOT_TIMEOUT = 30_000; // 30s for screenshots
+
+// Modern User-Agent — matches real Chrome to avoid bot detection
+const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 // ─── Browser Lifecycle ──────────────────────────────────────────
 
@@ -44,7 +49,13 @@ export async function getBrowser(): Promise<Browser> {
         '--disable-gpu',
         '--disable-extensions',
         '--disable-background-networking',
-        '--single-process',         // More stable in containers
+        '--disable-software-rasterizer',
+        '--disable-translate',
+        '--disable-sync',
+        '--disable-default-apps',
+        '--no-first-run',
+        '--no-zygote',              // Better for containers than --single-process
+        '--js-flags=--max-old-space-size=256', // Cap V8 heap at 256MB
       ],
     });
 
@@ -66,27 +77,36 @@ export async function getBrowser(): Promise<Browser> {
 }
 
 export async function createPage(): Promise<Page> {
+  // Concurrency guard — prevent OOM from too many simultaneous pages
+  if (activePages >= MAX_CONCURRENT_PAGES) {
+    throw new Error(`Browser concurrency limit reached (${MAX_CONCURRENT_PAGES} pages). Wait for current pages to close.`);
+  }
+
   const b = await getBrowser();
 
   let context: BrowserContext;
+  const contextOpts = {
+    userAgent: USER_AGENT,
+    viewport: { width: 1280, height: 800 },
+    // Reduce detection — look like a real browser
+    locale: 'en-US',
+    timezoneId: 'America/New_York',
+    javaScriptEnabled: true,
+  };
+
   try {
-    context = await b.newContext({
-      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-      viewport: { width: 1280, height: 800 },
-    });
+    context = await b.newContext(contextOpts);
   } catch (err) {
     // Context creation failed — browser is likely dead
     logger.error('Failed to create browser context, killing browser', { error: err });
     await killBrowser();
     // Retry once with a fresh browser
     const fresh = await getBrowser();
-    context = await fresh.newContext({
-      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-      viewport: { width: 1280, height: 800 },
-    });
+    context = await fresh.newContext(contextOpts);
   }
 
   const page = await context.newPage();
+  activePages++;
 
   // Default navigation timeout for all goto calls on this page
   page.setDefaultNavigationTimeout(PAGE_TIMEOUT);
@@ -103,6 +123,7 @@ export async function safeClosePage(page: Page | null): Promise<void> {
     await page.close().catch(() => {});
     await ctx.close().catch(() => {});
   } catch {}
+  activePages = Math.max(0, activePages - 1);
 }
 
 /** Force-kill the browser and reset state */
@@ -131,6 +152,14 @@ export async function loadPage(url: string, waitMs: number = 3000): Promise<Load
   const page = await createPage();
 
   try {
+    // Block heavy resources to save memory and speed up loading
+    await page.route('**/*.{png,jpg,jpeg,gif,svg,webp,ico,woff,woff2,ttf,eot}', route => route.abort());
+    await page.route('**/*', (route) => {
+      const type = route.request().resourceType();
+      if (['media', 'font', 'image'].includes(type)) return route.abort();
+      return route.continue();
+    });
+
     const response = await page.goto(url, {
       waitUntil: 'domcontentloaded',
       timeout: PAGE_TIMEOUT,
