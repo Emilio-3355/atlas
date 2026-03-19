@@ -1,4 +1,4 @@
-import { execFile } from 'child_process';
+import { exec, execFile } from 'child_process';
 import { promisify } from 'util';
 import fs from 'fs';
 import path from 'path';
@@ -8,11 +8,12 @@ import { getEnv } from '../config/env.js';
 import { getTelegramBot } from './telegram.js';
 import logger from '../utils/logger.js';
 
+const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 
 const TEMP_DIR = '/tmp/atlas-video';
-const WHISPER_MAX_SIZE = 24 * 1024 * 1024; // 24MB safety margin from 25MB limit
-const MAX_AUDIO_DURATION = 7200; // 2 hours max
+const WHISPER_MAX_SIZE = 24 * 1024 * 1024; // 24MB (Whisper limit is 25MB)
+const MAX_AUDIO_DURATION = 7200; // 2 hours
 
 // ─── URL Detection ──────────────────────────────────────────────
 
@@ -23,8 +24,6 @@ export interface VideoInfo {
   platform: 'youtube' | 'instagram' | 'telegram';
   videoId: string;
   url: string;
-  title?: string;
-  duration?: number;
 }
 
 export function detectVideoUrl(text: string): VideoInfo | null {
@@ -63,259 +62,309 @@ function tempPath(suffix: string): string {
   return path.join(TEMP_DIR, `${crypto.randomBytes(8).toString('hex')}${suffix}`);
 }
 
-/** Check if a CLI tool is available */
-async function isToolAvailable(cmd: string): Promise<boolean> {
+async function isAvailable(cmd: string): Promise<boolean> {
   try {
-    await execFileAsync('which', [cmd], { timeout: 5000 });
+    await execAsync(`which ${cmd}`, { timeout: 3000 });
     return true;
   } catch {
     return false;
   }
 }
 
-// ─── Audio Download ─────────────────────────────────────────────
+function safeDelete(filePath: string) {
+  try { if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+}
 
-/** Download audio from a YouTube or Instagram URL via yt-dlp */
-export async function downloadAudio(url: string): Promise<{ filePath: string; title: string; duration: number }> {
+// ─── YouTube Subtitles (fast path — no download needed) ─────────
+
+/**
+ * Try to get YouTube subtitles/captions via yt-dlp.
+ * Returns the subtitle text if available, null otherwise.
+ */
+async function getYouTubeSubtitles(url: string): Promise<{ text: string; title: string; duration: number } | null> {
+  if (!(await isAvailable('yt-dlp'))) return null;
+
   ensureTempDir();
-
-  // Verify yt-dlp is available
-  if (!(await isToolAvailable('yt-dlp'))) {
-    throw new Error('yt-dlp is not installed on this server');
-  }
-
-  logger.info('Downloading audio via yt-dlp', { url });
+  const basePath = tempPath('_subs');
 
   try {
-    // Get video info first
+    // Get video info + write subtitles (auto-generated or manual)
     const { stdout: infoJson } = await execFileAsync('yt-dlp', [
-      '--dump-json', '--no-download', '--no-warnings', url,
+      '--dump-json',
+      '--no-download',
+      '--no-warnings',
+      url,
     ], { timeout: 30_000, maxBuffer: 10 * 1024 * 1024 });
 
     const info = JSON.parse(infoJson);
     const title = info.title || 'Unknown';
     const duration = info.duration || 0;
 
-    if (duration > MAX_AUDIO_DURATION) {
-      throw new Error(`Video too long (${Math.round(duration / 60)} min). Max ${MAX_AUDIO_DURATION / 60} min.`);
+    // Check if subtitles exist
+    const hasSubs = info.subtitles && Object.keys(info.subtitles).length > 0;
+    const hasAutoSubs = info.automatic_captions && Object.keys(info.automatic_captions).length > 0;
+
+    if (!hasSubs && !hasAutoSubs) {
+      logger.info('No subtitles available for YouTube video', { url, title });
+      return null;
     }
 
-    // Use a base path WITHOUT extension — yt-dlp adds its own
-    const basePath = tempPath('');
-    const expectedMp3 = basePath + '.mp3';
-
-    // Download audio only, extract to mp3
+    // Download subtitles only (prefer English, fall back to auto-generated)
     await execFileAsync('yt-dlp', [
-      '-x',                         // extract audio
-      '--audio-format', 'mp3',      // convert to mp3
-      '--audio-quality', '5',       // medium quality (smaller files)
-      '-o', basePath + '.%(ext)s',  // let yt-dlp manage extension
-      '--no-playlist',              // single video only
+      '--write-sub',
+      '--write-auto-sub',
+      '--sub-lang', 'en,es',
+      '--sub-format', 'vtt',
+      '--skip-download',
       '--no-warnings',
+      '-o', basePath,
       url,
-    ], { timeout: 180_000, maxBuffer: 10 * 1024 * 1024 });
+    ], { timeout: 30_000, maxBuffer: 10 * 1024 * 1024 });
 
-    // Find the output file — yt-dlp creates <base>.mp3
-    let actualPath: string | null = null;
-    if (fs.existsSync(expectedMp3)) {
-      actualPath = expectedMp3;
-    } else {
-      // Scan temp dir for files matching our base
-      const base = path.basename(basePath);
-      const files = fs.readdirSync(TEMP_DIR).filter(f => f.startsWith(base));
-      if (files.length > 0) {
-        actualPath = path.join(TEMP_DIR, files[0]);
-      }
+    // Find the subtitle file
+    const base = path.basename(basePath);
+    const subFiles = fs.readdirSync(TEMP_DIR)
+      .filter(f => f.startsWith(base) && (f.endsWith('.vtt') || f.endsWith('.srt')))
+      .map(f => path.join(TEMP_DIR, f));
+
+    if (subFiles.length === 0) {
+      logger.info('Subtitle download produced no files', { url });
+      return null;
     }
 
-    if (!actualPath || !fs.existsSync(actualPath)) {
-      throw new Error('yt-dlp completed but audio file not found');
+    // Parse VTT/SRT: strip timestamps and metadata, keep text
+    const raw = fs.readFileSync(subFiles[0], 'utf-8');
+    const text = parseSubtitles(raw);
+
+    // Clean up subtitle files
+    subFiles.forEach(safeDelete);
+
+    if (text.length < 50) {
+      logger.info('Subtitle text too short, falling back to audio', { url, len: text.length });
+      return null;
     }
 
-    const sizeMB = (fs.statSync(actualPath).size / 1024 / 1024).toFixed(1);
-    logger.info('Audio downloaded', { title, duration, sizeMB });
-
-    return { filePath: actualPath, title, duration };
-  } catch (err: any) {
-    // Provide more helpful error messages
-    const msg = err.message || String(err);
-    if (msg.includes('is not a valid URL') || msg.includes('Unsupported URL')) {
-      throw new Error(`URL not supported by yt-dlp: ${url}`);
-    }
-    if (msg.includes('Private video') || msg.includes('Sign in')) {
-      throw new Error('This video is private or requires login');
-    }
-    if (msg.includes('Video unavailable')) {
-      throw new Error('Video is unavailable or has been removed');
-    }
-    throw new Error(`Failed to download audio: ${msg}`);
+    logger.info('YouTube subtitles extracted', { title, duration, textLength: text.length });
+    return { text, title, duration };
+  } catch (err) {
+    logger.debug('Subtitle extraction failed, will try audio', { url, error: err });
+    // Clean up any partial files
+    const base = path.basename(basePath);
+    fs.readdirSync(TEMP_DIR).filter(f => f.startsWith(base)).forEach(f => safeDelete(path.join(TEMP_DIR, f)));
+    return null;
   }
 }
 
-/** Download audio from a Telegram video file */
-export async function downloadTelegramVideo(fileId: string): Promise<{ filePath: string }> {
+/** Parse VTT/SRT subtitle format into plain text, removing duplicates from auto-captions */
+function parseSubtitles(raw: string): string {
+  const lines = raw.split('\n');
+  const textLines: string[] = [];
+  const seen = new Set<string>();
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    // Skip empty lines, timestamps, VTT headers, position tags
+    if (!trimmed) continue;
+    if (trimmed === 'WEBVTT') continue;
+    if (trimmed.startsWith('Kind:') || trimmed.startsWith('Language:')) continue;
+    if (trimmed.startsWith('NOTE')) continue;
+    if (/^\d{2}:\d{2}/.test(trimmed)) continue; // timestamp line
+    if (/^\d+$/.test(trimmed)) continue; // SRT sequence number
+
+    // Strip HTML tags and VTT styling
+    const clean = trimmed
+      .replace(/<[^>]+>/g, '')
+      .replace(/\{[^}]+\}/g, '')
+      .trim();
+
+    if (clean && !seen.has(clean)) {
+      seen.add(clean);
+      textLines.push(clean);
+    }
+  }
+
+  return textLines.join(' ');
+}
+
+// ─── Audio Download + Transcribe (fallback) ─────────────────────
+
+async function downloadAndTranscribe(url: string): Promise<{ transcript: string; title: string; duration: number }> {
+  if (!(await isAvailable('yt-dlp'))) {
+    throw new Error('yt-dlp is not installed on this server. Cannot process video.');
+  }
+
+  ensureTempDir();
+
+  // Step 1: Get video info
+  logger.info('Downloading audio for transcription', { url });
+
+  const { stdout: infoJson } = await execFileAsync('yt-dlp', [
+    '--dump-json', '--no-download', '--no-warnings', url,
+  ], { timeout: 30_000, maxBuffer: 10 * 1024 * 1024 });
+
+  const info = JSON.parse(infoJson);
+  const title = info.title || 'Unknown';
+  const duration = info.duration || 0;
+
+  if (duration > MAX_AUDIO_DURATION) {
+    throw new Error(`Video too long (${Math.round(duration / 60)} min). Max is ${MAX_AUDIO_DURATION / 60} min.`);
+  }
+
+  // Step 2: Download audio — use %(ext)s so yt-dlp manages the extension
+  const basePath = tempPath('');
+
+  await execFileAsync('yt-dlp', [
+    '-x',
+    '--audio-format', 'mp3',
+    '--audio-quality', '5',
+    '-o', `${basePath}.%(ext)s`,
+    '--no-playlist',
+    '--no-warnings',
+    url,
+  ], { timeout: 180_000, maxBuffer: 10 * 1024 * 1024 });
+
+  // Step 3: Find the output file
+  const base = path.basename(basePath);
+  const candidates = fs.readdirSync(TEMP_DIR)
+    .filter(f => f.startsWith(base) && !f.includes('_chunk'))
+    .map(f => path.join(TEMP_DIR, f));
+
+  if (candidates.length === 0) {
+    throw new Error('yt-dlp completed but no audio file found');
+  }
+
+  const audioPath = candidates[0];
+  const sizeMB = (fs.statSync(audioPath).size / 1024 / 1024).toFixed(1);
+  logger.info('Audio downloaded', { title, duration, sizeMB, path: audioPath });
+
+  // Step 4: Transcribe
+  try {
+    const transcript = await transcribeAudioFile(audioPath);
+    return { transcript, title, duration };
+  } finally {
+    safeDelete(audioPath);
+  }
+}
+
+// ─── Transcription ──────────────────────────────────────────────
+
+async function transcribeAudioFile(filePath: string): Promise<string> {
+  const openai = new OpenAI({ apiKey: getEnv().OPENAI_API_KEY });
+  const stat = fs.statSync(filePath);
+
+  // If small enough, transcribe directly
+  if (stat.size <= WHISPER_MAX_SIZE) {
+    return await whisperTranscribe(openai, filePath);
+  }
+
+  // Need to split — check for ffmpeg
+  if (!(await isAvailable('ffmpeg'))) {
+    throw new Error('Audio file too large and ffmpeg not available for splitting');
+  }
+
+  // Get duration
+  let totalDuration: number;
+  try {
+    const { stdout } = await execFileAsync('ffprobe', [
+      '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', filePath,
+    ], { timeout: 10_000 });
+    totalDuration = parseFloat(stdout.trim());
+  } catch {
+    throw new Error('Cannot determine audio duration for splitting');
+  }
+
+  const numChunks = Math.ceil(stat.size / WHISPER_MAX_SIZE);
+  const chunkSec = Math.ceil(totalDuration / numChunks);
+  const transcripts: string[] = [];
+  const chunkPaths: string[] = [];
+
+  for (let i = 0; i < numChunks; i++) {
+    const chunkPath = tempPath(`_chunk${i}.mp3`);
+    chunkPaths.push(chunkPath);
+
+    await execFileAsync('ffmpeg', [
+      '-i', filePath, '-ss', String(i * chunkSec), '-t', String(chunkSec),
+      '-acodec', 'libmp3lame', '-q:a', '5', '-y', chunkPath,
+    ], { timeout: 60_000 });
+
+    if (fs.existsSync(chunkPath) && fs.statSync(chunkPath).size > 1000) {
+      try {
+        const text = await whisperTranscribe(openai, chunkPath);
+        transcripts.push(text);
+      } catch (err) {
+        logger.warn('Chunk transcription failed', { chunk: i, error: err });
+      }
+    }
+  }
+
+  // Clean up chunks
+  chunkPaths.forEach(safeDelete);
+
+  if (transcripts.length === 0) {
+    throw new Error('All transcription chunks failed');
+  }
+
+  logger.info('Audio transcribed in chunks', { chunks: transcripts.length, totalChars: transcripts.join('').length });
+  return transcripts.join('\n\n');
+}
+
+async function whisperTranscribe(openai: OpenAI, filePath: string): Promise<string> {
+  const buffer = fs.readFileSync(filePath);
+  const ext = path.extname(filePath).slice(1) || 'mp3';
+
+  const result = await openai.audio.transcriptions.create({
+    file: new File([buffer], `audio.${ext}`, { type: `audio/${ext}` }),
+    model: 'whisper-1',
+  });
+
+  return result.text;
+}
+
+// ─── Telegram Video ─────────────────────────────────────────────
+
+async function downloadTelegramAudio(fileId: string): Promise<string> {
   ensureTempDir();
 
   const bot = getTelegramBot();
   if (!bot) throw new Error('Telegram bot not configured');
 
   const file = await bot.api.getFile(fileId);
-  const filePath = file.file_path;
-  if (!filePath) throw new Error('Telegram file path not available');
+  if (!file.file_path) throw new Error('Telegram file path not available');
 
+  // Telegram Bot API: max 20MB download
   const token = getEnv().TELEGRAM_BOT_TOKEN;
-  const fileUrl = `https://api.telegram.org/file/bot${token}/${filePath}`;
-  const response = await fetch(fileUrl);
-  if (!response.ok) throw new Error(`Failed to download from Telegram: ${response.status}`);
+  const resp = await fetch(`https://api.telegram.org/file/bot${token}/${file.file_path}`);
+  if (!resp.ok) throw new Error(`Telegram download failed: ${resp.status}`);
 
-  const buffer = Buffer.from(await response.arrayBuffer());
-  const ext = path.extname(filePath) || '.mp4';
-  const localPath = tempPath(ext);
-  fs.writeFileSync(localPath, buffer);
+  const buffer = Buffer.from(await resp.arrayBuffer());
+  const ext = path.extname(file.file_path) || '.mp4';
+  const videoPath = tempPath(ext);
+  fs.writeFileSync(videoPath, buffer);
 
-  logger.info('Telegram video downloaded', { fileId, sizeMB: (buffer.length / 1024 / 1024).toFixed(1) });
-
-  // If it's already an audio format, return as-is
-  const audioExts = ['.mp3', '.ogg', '.wav', '.m4a', '.aac'];
-  if (audioExts.includes(ext.toLowerCase())) {
-    return { filePath: localPath };
+  // If already audio, return as-is
+  if (['.mp3', '.ogg', '.wav', '.m4a', '.aac', '.opus'].includes(ext.toLowerCase())) {
+    return videoPath;
   }
 
-  // Convert to mp3 using ffmpeg
-  if (!(await isToolAvailable('ffmpeg'))) {
-    // If no ffmpeg, try to transcribe the video file directly (Whisper accepts some video formats)
-    return { filePath: localPath };
+  // Extract audio with ffmpeg
+  if (!(await isAvailable('ffmpeg'))) {
+    return videoPath; // Whisper can handle some video formats
   }
 
   const mp3Path = tempPath('.mp3');
   try {
     await execFileAsync('ffmpeg', [
-      '-i', localPath,
-      '-vn',                       // no video
-      '-acodec', 'libmp3lame',
-      '-q:a', '5',                 // medium quality
-      '-y',                        // overwrite
-      mp3Path,
+      '-i', videoPath, '-vn', '-acodec', 'libmp3lame', '-q:a', '5', '-y', mp3Path,
     ], { timeout: 120_000 });
-
-    // Clean up original video file
-    try { fs.unlinkSync(localPath); } catch {}
-    return { filePath: mp3Path };
-  } catch (err) {
-    // If ffmpeg fails, try the original file
-    logger.warn('ffmpeg conversion failed, trying original file', { error: err });
-    try { fs.unlinkSync(mp3Path); } catch {}
-    return { filePath: localPath };
-  }
-}
-
-// ─── Transcription ──────────────────────────────────────────────
-
-/** Split audio into chunks if over Whisper's 25MB limit */
-async function splitAudioIfNeeded(filePath: string): Promise<string[]> {
-  const stat = fs.statSync(filePath);
-
-  if (stat.size <= WHISPER_MAX_SIZE) {
-    return [filePath];
-  }
-
-  if (!(await isToolAvailable('ffprobe')) || !(await isToolAvailable('ffmpeg'))) {
-    logger.warn('ffmpeg/ffprobe not available for splitting — sending full file');
-    return [filePath];
-  }
-
-  const totalSize = stat.size;
-  const numChunks = Math.ceil(totalSize / WHISPER_MAX_SIZE);
-
-  // Get duration via ffprobe
-  let totalDuration: number;
-  try {
-    const { stdout } = await execFileAsync('ffprobe', [
-      '-v', 'error', '-show_entries', 'format=duration',
-      '-of', 'csv=p=0', filePath,
-    ], { timeout: 10_000 });
-    totalDuration = parseFloat(stdout.trim());
+    safeDelete(videoPath);
+    return mp3Path;
   } catch {
-    // Can't determine duration — return original
-    logger.warn('Cannot determine audio duration, sending full file');
-    return [filePath];
+    safeDelete(mp3Path);
+    return videoPath; // Fall back to original
   }
-
-  const chunkDuration = Math.ceil(totalDuration / numChunks);
-  const chunks: string[] = [];
-
-  for (let i = 0; i < numChunks; i++) {
-    const chunkPath = tempPath(`_chunk${i}.mp3`);
-    const startTime = i * chunkDuration;
-
-    try {
-      await execFileAsync('ffmpeg', [
-        '-i', filePath,
-        '-ss', String(startTime),
-        '-t', String(chunkDuration),
-        '-acodec', 'libmp3lame',
-        '-q:a', '5',
-        '-y',
-        chunkPath,
-      ], { timeout: 60_000 });
-
-      if (fs.existsSync(chunkPath) && fs.statSync(chunkPath).size > 0) {
-        chunks.push(chunkPath);
-      }
-    } catch (err) {
-      logger.warn('Failed to create audio chunk', { chunk: i, error: err });
-    }
-  }
-
-  if (chunks.length === 0) {
-    logger.warn('All chunks failed, returning original file');
-    return [filePath];
-  }
-
-  logger.info('Audio split into chunks', { original: filePath, chunks: chunks.length, totalDuration });
-  return chunks;
 }
 
-/** Transcribe audio file(s) via OpenAI Whisper */
-export async function transcribeAudio(filePath: string): Promise<string> {
-  const openai = new OpenAI({ apiKey: getEnv().OPENAI_API_KEY });
-  const chunks = await splitAudioIfNeeded(filePath);
-
-  const transcripts: string[] = [];
-
-  for (const chunkPath of chunks) {
-    const buffer = fs.readFileSync(chunkPath);
-    const ext = path.extname(chunkPath).slice(1) || 'mp3';
-
-    try {
-      const transcription = await openai.audio.transcriptions.create({
-        file: new File([buffer], `audio.${ext}`, { type: `audio/${ext}` }),
-        model: 'whisper-1',
-      });
-
-      transcripts.push(transcription.text);
-      logger.debug('Chunk transcribed', { chunk: chunkPath, length: transcription.text.length });
-    } catch (err) {
-      logger.error('Whisper transcription failed for chunk', { chunk: chunkPath, error: err });
-      // Continue with other chunks
-    }
-  }
-
-  // Clean up chunk files (but not the original if it wasn't split)
-  for (const chunkPath of chunks) {
-    if (chunkPath !== filePath) {
-      try { fs.unlinkSync(chunkPath); } catch {}
-    }
-  }
-
-  if (transcripts.length === 0) {
-    throw new Error('Transcription failed — no audio content could be extracted');
-  }
-
-  return transcripts.join('\n\n');
-}
-
-// ─── Full Pipeline ──────────────────────────────────────────────
+// ─── Public API ─────────────────────────────────────────────────
 
 export interface VideoSummaryResult {
   title: string;
@@ -323,52 +372,68 @@ export interface VideoSummaryResult {
   duration: number;
   transcript: string;
   url: string;
+  method: 'subtitles' | 'whisper';
 }
 
-/** Full pipeline: URL → download → transcribe → return transcript */
+/** Process a YouTube or Instagram video URL → transcript */
 export async function processVideoUrl(url: string): Promise<VideoSummaryResult> {
   const video = detectVideoUrl(url);
   if (!video) throw new Error('Not a recognized video URL');
 
-  const { filePath, title, duration } = await downloadAudio(video.url);
-
-  try {
-    const transcript = await transcribeAudio(filePath);
-    return { title, platform: video.platform, duration, transcript, url: video.url };
-  } finally {
-    try { fs.unlinkSync(filePath); } catch {}
+  // YouTube: try subtitles first (fast, free, no audio download)
+  if (video.platform === 'youtube') {
+    const subs = await getYouTubeSubtitles(video.url);
+    if (subs) {
+      return {
+        title: subs.title,
+        platform: 'youtube',
+        duration: subs.duration,
+        transcript: subs.text,
+        url: video.url,
+        method: 'subtitles',
+      };
+    }
   }
+
+  // Fallback: download audio → Whisper transcription
+  const result = await downloadAndTranscribe(video.url);
+  return {
+    title: result.title,
+    platform: video.platform,
+    duration: result.duration,
+    transcript: result.transcript,
+    url: video.url,
+    method: 'whisper',
+  };
 }
 
-/** Process a Telegram-forwarded video file */
+/** Process a Telegram-forwarded video → transcript */
 export async function processTelegramVideo(fileId: string): Promise<VideoSummaryResult> {
-  const { filePath } = await downloadTelegramVideo(fileId);
+  const audioPath = await downloadTelegramAudio(fileId);
 
   try {
-    const transcript = await transcribeAudio(filePath);
+    const transcript = await transcribeAudioFile(audioPath);
     return {
       title: 'Telegram Video',
       platform: 'telegram',
       duration: 0,
       transcript,
       url: '',
+      method: 'whisper',
     };
   } finally {
-    try { fs.unlinkSync(filePath); } catch {}
+    safeDelete(audioPath);
   }
 }
 
-// ─── Cleanup ────────────────────────────────────────────────────
-
-/** Clean up old temp files (called periodically) */
+/** Clean up old temp files */
 export function cleanupTempFiles(maxAgeMs: number = 3600_000): void {
   if (!fs.existsSync(TEMP_DIR)) return;
   const now = Date.now();
   for (const file of fs.readdirSync(TEMP_DIR)) {
-    const fullPath = path.join(TEMP_DIR, file);
     try {
-      const stat = fs.statSync(fullPath);
-      if (now - stat.mtimeMs > maxAgeMs) fs.unlinkSync(fullPath);
+      const full = path.join(TEMP_DIR, file);
+      if (now - fs.statSync(full).mtimeMs > maxAgeMs) fs.unlinkSync(full);
     } catch {}
   }
 }

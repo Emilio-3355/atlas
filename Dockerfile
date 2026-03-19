@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y \
     libglib2.0-0 libdbus-1-3 libgtk-3-0 libxkbcommon0 \
     fonts-liberation fonts-noto-color-emoji \
     ffmpeg curl ca-certificates \
-    && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
+    && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux -o /usr/local/bin/yt-dlp \
     && chmod a+rx /usr/local/bin/yt-dlp \
     && rm -rf /var/lib/apt/lists/*
 

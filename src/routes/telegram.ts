@@ -58,11 +58,13 @@ telegramRouter.post('/', async (c) => {
         }
       }
     } else if (message.video || message.animation) {
-      // Video file or GIF sent directly — pass file_id for video summarization
+      // Video file sent directly — tell agent to use summarize_video tool with the file_id
       const fileId = message.video?.file_id || message.animation?.file_id;
       const caption = message.caption || '';
       if (fileId) {
-        text = `[VIDEO_FILE:${fileId}] ${caption || 'Summarize this video'}`.trim();
+        text = caption
+          ? `${caption}\n\n(This message includes a video file. Use summarize_video with telegram_file_id="${fileId}" to process it.)`
+          : `Summarize this video. Use summarize_video with telegram_file_id="${fileId}" to process it.`;
         logger.info('Video file received', { chatId, fileId, hasCaption: !!caption });
       }
     } else if (message.caption) {
