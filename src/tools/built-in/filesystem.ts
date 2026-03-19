@@ -25,7 +25,7 @@ export const filesystemTool: ToolDefinition = {
   name: 'filesystem',
   description: 'Read, write, list, and search files on the Atlas server. Jailed to /app/ (project) and /tmp/atlas-*/ directories. Use for reading logs, configs, managing uploaded/downloaded files.',
   category: 'action',
-  requiresApproval: false,
+  requiresApproval: true,
   inputSchema: {
     type: 'object' as const,
     properties: {

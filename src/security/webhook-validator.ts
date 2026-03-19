@@ -19,10 +19,13 @@ export function validateTwilioSignature(url: string, params: Record<string, stri
     .update(data, 'utf-8')
     .digest('base64');
 
-  return crypto.timingSafeEqual(
-    Buffer.from(signature, 'base64'),
-    Buffer.from(expected, 'base64')
-  );
+  const sigBuffer = Buffer.from(signature, 'base64');
+  const expectedBuffer = Buffer.from(expected, 'base64');
+
+  // timingSafeEqual throws on length mismatch — reject outright
+  if (sigBuffer.length !== expectedBuffer.length) return false;
+
+  return crypto.timingSafeEqual(sigBuffer, expectedBuffer);
 }
 
 export async function twilioWebhookMiddleware(c: Context, next: Next) {

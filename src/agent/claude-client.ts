@@ -33,6 +33,9 @@ const MODEL_CONFIG: Record<ReasoningDepth, { model: string; maxTokens: number }>
   expert: { model: 'claude-opus-4-6', maxTokens: 8192 },
 };
 
+const MAX_RETRIES = 2;
+const RETRY_DELAYS = [1000, 3000]; // ms
+
 export async function callClaude(req: ClaudeRequest): Promise<ClaudeResponse> {
   const config = MODEL_CONFIG[req.depth];
   const maxTokens = req.maxTokens || config.maxTokens;
@@ -57,14 +60,47 @@ export async function callClaude(req: ClaudeRequest): Promise<ClaudeResponse> {
     params.max_tokens = maxTokens + Math.floor(maxTokens * 0.6);
   }
 
-  const response = await getClient().messages.create(params);
+  // Timeout per depth: fast=60s, deep=120s, expert=180s
+  const timeoutMs = req.depth === 'fast' ? 60_000 : req.depth === 'deep' ? 120_000 : 180_000;
 
-  return {
-    content: response.content,
-    stopReason: response.stop_reason,
-    usage: { inputTokens: response.usage.input_tokens, outputTokens: response.usage.output_tokens },
-    model: response.model,
-  };
+  // Retry with exponential backoff for transient errors
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      const delay = RETRY_DELAYS[attempt - 1] || 3000;
+      logger.warn('Retrying Claude API call', { attempt, delay, depth: req.depth });
+      await new Promise((r) => setTimeout(r, delay));
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await getClient().messages.create(params, { signal: controller.signal as any });
+      clearTimeout(timer);
+
+      return {
+        content: response.content,
+        stopReason: response.stop_reason,
+        usage: { inputTokens: response.usage.input_tokens, outputTokens: response.usage.output_tokens },
+        model: response.model,
+      };
+    } catch (err: any) {
+      clearTimeout(timer);
+      lastError = err instanceof Error ? err : new Error(String(err));
+
+      // Only retry on transient errors (429, 500, 502, 503, 529, timeouts)
+      const status = err?.status || err?.statusCode;
+      const isTransient = status === 429 || status === 500 || status === 502 || status === 503 || status === 529
+        || err?.name === 'AbortError' || err?.code === 'ECONNRESET' || err?.code === 'ETIMEDOUT';
+
+      if (!isTransient || attempt === MAX_RETRIES) {
+        throw lastError;
+      }
+    }
+  }
+
+  throw lastError || new Error('Claude API call failed after retries');
 }
 
 export function extractTextContent(content: Anthropic.ContentBlock[]): string {

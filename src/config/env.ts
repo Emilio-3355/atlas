@@ -30,6 +30,7 @@ const envSchema = z.object({
 
   TELEGRAM_BOT_TOKEN: z.string().default(''),
   TELEGRAM_CHAT_ID: z.string().default(''),
+  TELEGRAM_WEBHOOK_SECRET: z.string().default(''),
 
   DAEMON_SECRET: z.string().default(''),
   DASHBOARD_TOKEN: z.string().default(''),

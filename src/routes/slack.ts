@@ -34,7 +34,7 @@ slackRouter.post('/', async (c) => {
       return c.json({ error: 'Request too old' }, 403);
     }
 
-    if (!verifySlackSignature(signingSecret, timestamp, body, signature)) {
+    if (!(await verifySlackSignature(signingSecret, timestamp, body, signature))) {
       logger.warn('Invalid Slack signature');
       return c.json({ error: 'Invalid signature' }, 403);
     }

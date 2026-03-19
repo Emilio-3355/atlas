@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { getAuthorizedChatId, transcribeVoiceMessage, sendTelegramMessage } from '../services/telegram.js';
 import { messageQueue } from '../agent/message-queue.js';
 import { rateLimiter } from '../security/rate-limiter.js';
+import { getEnv } from '../config/env.js';
 import { recordError } from './health.js';
 import logger from '../utils/logger.js';
 
@@ -9,6 +10,19 @@ const telegramRouter = new Hono();
 
 // Rate limit Telegram webhook
 telegramRouter.use('*', rateLimiter({ maxRequests: 30, windowMs: 60_000, keyPrefix: 'rl:tg' }));
+
+// Telegram webhook secret_token verification
+telegramRouter.use('*', async (c, next) => {
+  const secret = getEnv().TELEGRAM_WEBHOOK_SECRET;
+  if (secret) {
+    const headerToken = c.req.header('x-telegram-bot-api-secret-token');
+    if (headerToken !== secret) {
+      logger.warn('Telegram webhook secret mismatch', { received: !!headerToken });
+      return c.json({ ok: true }, 401);
+    }
+  }
+  return next();
+});
 
 telegramRouter.post('/', async (c) => {
   try {
@@ -26,7 +40,7 @@ telegramRouter.post('/', async (c) => {
       return c.json({ ok: true });
     }
 
-    // Extract text from message — supports text, voice, audio, video notes, captions
+    // Extract text from message — supports text, voice, audio, video notes, videos, captions
     let text: string | null = null;
 
     if (message.text) {
@@ -42,6 +56,14 @@ telegramRouter.post('/', async (c) => {
           logger.error('Voice transcription failed', { error: err, chatId });
           text = null;
         }
+      }
+    } else if (message.video || message.animation) {
+      // Video file or GIF sent directly — pass file_id for video summarization
+      const fileId = message.video?.file_id || message.animation?.file_id;
+      const caption = message.caption || '';
+      if (fileId) {
+        text = `[VIDEO_FILE:${fileId}] ${caption || 'Summarize this video'}`.trim();
+        logger.info('Video file received', { chatId, fileId, hasCaption: !!caption });
       }
     } else if (message.caption) {
       // Photo/video/document with caption

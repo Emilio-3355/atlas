@@ -105,8 +105,12 @@ async function start() {
       const webhookUrl = `${env.BASE_URL}/webhook/telegram`;
       const bot = getTelegramBot();
       if (bot) {
-        await bot.api.setWebhook(webhookUrl);
-        logger.info('Telegram webhook set', { url: webhookUrl });
+        const webhookOpts: any = {};
+        if (env.TELEGRAM_WEBHOOK_SECRET) {
+          webhookOpts.secret_token = env.TELEGRAM_WEBHOOK_SECRET;
+        }
+        await bot.api.setWebhook(webhookUrl, webhookOpts);
+        logger.info('Telegram webhook set', { url: webhookUrl, hasSecret: !!env.TELEGRAM_WEBHOOK_SECRET });
       }
     } catch (err) {
       logger.warn('Failed to set Telegram webhook (non-fatal)', { error: err });

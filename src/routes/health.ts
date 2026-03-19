@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { query } from '../config/database.js';
 import { getRedis } from '../config/redis.js';
 import { getToolRegistry } from '../tools/registry.js';
+import { getEnv } from '../config/env.js';
 
 // In-memory error ring buffer for debugging (last 10 errors)
 const recentErrors: Array<{ timestamp: string; error: string; stack?: string }> = [];
@@ -50,8 +51,17 @@ healthRouter.get('/', async (c) => {
   );
 });
 
+// Auth gate for debug endpoints — require DASHBOARD_TOKEN in production
+function debugAuth(c: any): boolean {
+  const token = getEnv().DASHBOARD_TOKEN;
+  if (!token) return true; // No token = dev mode, allow
+  const provided = c.req.query('token') || c.req.header('authorization')?.replace('Bearer ', '');
+  return provided === token;
+}
+
 // Debug: dump conversation messages for the active Telegram conversation
 healthRouter.get('/debug/messages', async (c) => {
+  if (!debugAuth(c)) return c.json({ error: 'Unauthorized' }, 401);
   try {
     const conv = await query(
       `SELECT * FROM conversations WHERE user_phone LIKE 'tg:%' AND status = 'active'
@@ -78,6 +88,7 @@ healthRouter.get('/debug/messages', async (c) => {
 
 // Debug endpoint — shows recent errors and tool count
 healthRouter.get('/debug', async (c) => {
+  if (!debugAuth(c)) return c.json({ error: 'Unauthorized' }, 401);
   const registry = getToolRegistry();
   const toolNames = registry.getNames();
 

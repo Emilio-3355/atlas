@@ -3,13 +3,9 @@ import { isAuthorizedUser } from '../security/auth.js';
 import { twilioWebhookMiddleware } from '../security/webhook-validator.js';
 import { rateLimiter } from '../security/rate-limiter.js';
 import { messageQueue } from '../agent/message-queue.js';
-import { processMessage } from '../agent/core.js';
 import logger from '../utils/logger.js';
 
 const whatsappRouter = new Hono();
-
-// Set up the message handler
-messageQueue.setHandler(processMessage);
 
 // Apply middleware
 whatsappRouter.use('*', rateLimiter({ maxRequests: 30, windowMs: 60_000, keyPrefix: 'rl:wa' }));

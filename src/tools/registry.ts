@@ -157,6 +157,14 @@ export async function registerBuiltInToolsAsync(): Promise<void> {
     logger.warn('Failed to load filesystem tool', { error: err });
   }
 
+  // Register video summarization tool
+  try {
+    const videoMod = await import('./built-in/summarize-video.js');
+    if (videoMod.summarizeVideoTool) reg.register(videoMod.summarizeVideoTool);
+  } catch (err) {
+    logger.warn('Failed to load video summarize tool', { error: err });
+  }
+
   logger.info(`Registered ${reg.getAll().length} built-in tools`);
 }
 
