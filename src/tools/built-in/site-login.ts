@@ -1,5 +1,5 @@
 import type { ToolDefinition, ToolResult, ToolContext } from '../../types/index.js';
-import { createPage, safeClosePage } from '../../services/browser.js';
+import { createPageWithCookies, safeClosePage, saveCookies } from '../../services/browser.js';
 import { query } from '../../config/database.js';
 import { tagContent } from '../../security/content-trust.js';
 import logger from '../../utils/logger.js';
@@ -302,8 +302,9 @@ export const siteLoginTool: ToolDefinition = {
           return { success: false, error: `No credentials stored for "${siteId}". Use store_credentials first.` };
         }
 
-        const page = await createPage();
-        const startUrl = page.url();
+        // Use persistent cookies — avoids Duo re-prompts for Columbia
+        const cookieDomain = siteId.includes('columbia') || ['vergil', 'courseworks', 'lionmail'].includes(siteId) ? 'columbia' : siteId;
+        const page = await createPageWithCookies(cookieDomain);
 
         try {
           // Navigate to login page
@@ -379,28 +380,62 @@ export const siteLoginTool: ToolDefinition = {
 
             // Wait up to 65 seconds for MFA approval
             let approved = false;
+            const duoStartUrl = currentUrl;
             for (let i = 0; i < 22; i++) {
               await page.waitForTimeout(3000);
               currentUrl = page.url();
-              // If URL changed away from login/duo pages, we're in
-              if (!currentUrl.includes('duo') &&
-                  !currentUrl.includes('cas.columbia.edu/cas/login') &&
-                  !currentUrl.includes('login') &&
-                  currentUrl !== loginUrl) {
+
+              // Check if we're past MFA — URL changed to something that's NOT the Duo/CAS page
+              const stillOnDuo = currentUrl.includes('duosecurity.com') ||
+                currentUrl.includes('duo.columbia.edu') ||
+                currentUrl === duoStartUrl;
+              const stillOnCas = currentUrl.includes('cas.columbia.edu/cas/login');
+
+              if (!stillOnDuo && !stillOnCas && currentUrl !== loginUrl) {
                 approved = true;
                 break;
               }
+
               // Also check if a known success indicator matches
               if (knownSite?.postLoginUrl && currentUrl.includes(new URL(knownSite.postLoginUrl).hostname)) {
+                approved = true;
+                break;
+              }
+
+              // Check page content for success indicators
+              const bodyText = await page.evaluate('(document.body?.innerText || "").slice(0, 1000)').catch(() => '');
+              if (typeof bodyText === 'string' && (bodyText.includes('Success') || bodyText.includes('Authenticated') || bodyText.includes('Welcome'))) {
                 approved = true;
                 break;
               }
             }
 
             if (!approved) {
+              // Save cookies even on timeout — partial session might help next time
+              await saveCookies(page, cookieDomain);
               await safeClosePage(page);
-              return { success: false, error: 'MFA timeout (65s). Approve the push on your phone and try again.' };
+              return { success: false, error: 'MFA timeout (65s). Approve the Duo push on your phone and try again. Tell JP: check your Duo Mobile app.' };
             }
+
+            // Try to click "Remember this browser" / "Yes, trust browser" after Duo
+            try {
+              const trustSelectors = [
+                'button:has-text("Yes, trust browser")',
+                'button:has-text("Remember")',
+                'input[name="dampen_choice"][value="true"]',
+                '#trust-browser-button',
+                'button:has-text("Trust")',
+              ];
+              for (const sel of trustSelectors) {
+                const btn = await page.$(sel);
+                if (btn && await btn.isVisible().catch(() => false)) {
+                  await btn.click();
+                  logger.info('Clicked "trust browser" after Duo');
+                  await page.waitForTimeout(2000);
+                  break;
+                }
+              }
+            } catch { /* non-critical */ }
           }
 
           // Navigate to target if specified
@@ -437,6 +472,10 @@ export const siteLoginTool: ToolDefinition = {
           `) as Array<{ text: string; url: string }>;
 
           const finalUrl = page.url();
+
+          // Save cookies so Duo doesn't prompt next time
+          await saveCookies(page, cookieDomain);
+
           await safeClosePage(page);
 
           return {

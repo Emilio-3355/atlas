@@ -4,6 +4,9 @@ import logger from '../utils/logger.js';
 let browser: Browser | null = null;
 let consecutiveFailures = 0;
 let activePages = 0;
+
+// Persistent cookie storage — survives across page sessions
+let storedCookies: Map<string, any[]> = new Map();
 const MAX_CONSECUTIVE_FAILURES = 5;
 const MAX_CONCURRENT_PAGES = 3;   // Prevent OOM from too many pages
 const PAGE_TIMEOUT = 45_000;      // 45s for page navigation
@@ -112,6 +115,35 @@ export async function createPage(): Promise<Page> {
   page.setDefaultNavigationTimeout(PAGE_TIMEOUT);
   page.setDefaultTimeout(PAGE_TIMEOUT);
 
+  return page;
+}
+
+/** Save cookies from a page's context for a specific domain group */
+export async function saveCookies(page: Page, domain: string): Promise<void> {
+  try {
+    const ctx = page.context();
+    const cookies = await ctx.cookies();
+    if (cookies.length > 0) {
+      storedCookies.set(domain, cookies);
+      logger.info('Saved browser cookies', { domain, count: cookies.length });
+    }
+  } catch (err) {
+    logger.debug('Failed to save cookies', { error: err });
+  }
+}
+
+/** Create a page with restored cookies for a domain */
+export async function createPageWithCookies(domain: string): Promise<Page> {
+  const page = await createPage();
+  const cookies = storedCookies.get(domain);
+  if (cookies && cookies.length > 0) {
+    try {
+      await page.context().addCookies(cookies);
+      logger.info('Restored browser cookies', { domain, count: cookies.length });
+    } catch (err) {
+      logger.debug('Failed to restore cookies', { error: err });
+    }
+  }
   return page;
 }
 
