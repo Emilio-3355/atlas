@@ -23,6 +23,28 @@ import type { AgentContext, AgentResponse, ReasoningDepth, ToolContext, PendingA
 
 const MAX_TOOL_ITERATIONS = 10;
 
+// ─── Token Cost Tracking ────────────────────────────────────────
+
+// Anthropic pricing per million tokens (as of 2025)
+const MODEL_PRICING: Record<string, { input: number; output: number }> = {
+  'claude-sonnet-4-6': { input: 3, output: 15 },
+  'claude-opus-4-6':   { input: 15, output: 75 },
+  'claude-code-daemon': { input: 0, output: 0 },
+};
+
+function calculateCost(inputTokens: number, outputTokens: number, model: string): number {
+  const p = MODEL_PRICING[model] || MODEL_PRICING['claude-sonnet-4-6'];
+  return (inputTokens * p.input + outputTokens * p.output) / 1_000_000;
+}
+
+function formatCostFooter(inputTokens: number, outputTokens: number, cost: number, durationMs: number, model: string): string {
+  const costStr = cost < 0.01 ? `$${cost.toFixed(4)}` : `$${cost.toFixed(3)}`;
+  const totalTokens = inputTokens + outputTokens;
+  const seconds = (durationMs / 1000).toFixed(1);
+  const modelShort = model.includes('opus') ? 'opus' : model.includes('daemon') ? 'free' : 'sonnet';
+  return `_⚡ ${totalTokens.toLocaleString()} tokens (${inputTokens.toLocaleString()}↑ ${outputTokens.toLocaleString()}↓) · ${costStr} · ${seconds}s · ${modelShort}_`;
+}
+
 /**
  * Normalize user phone to a canonical ID so ALL channels share one conversation.
  * WhatsApp uses raw phone, Telegram uses tg:chatId, Voice uses caller number.
@@ -279,6 +301,9 @@ async function _processMessageInner(phone: string, incomingMessage: string, chan
   let iterations = 0;
   let currentMessages = [...claudeMessages];
   const toolsUsed: string[] = [];
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+  let lastModel = '';
 
   while (iterations < MAX_TOOL_ITERATIONS) {
     iterations++;
@@ -294,6 +319,11 @@ async function _processMessageInner(phone: string, incomingMessage: string, chan
       tools: claudeTools.length > 0 ? claudeTools : undefined,
       depth: currentDepth,
     });
+
+    // Accumulate token usage across all iterations
+    totalInputTokens += response.usage.inputTokens;
+    totalOutputTokens += response.usage.outputTokens;
+    lastModel = response.model;
 
     // Check for tool use — handle ALL tool_use blocks in the response
     const allToolUseBlocks = extractAllToolUse(response.content);
@@ -395,8 +425,14 @@ async function _processMessageInner(phone: string, incomingMessage: string, chan
     const textResponse = extractTextContent(response.content);
 
     if (textResponse) {
-      await respondToUser(phone, textResponse, language, channel);
-      await storeMessage(conversation.id, 'assistant', textResponse);
+      // Append cost footer for text channels (not voice — would be spoken)
+      const durationMs = Date.now() - startTime;
+      const cost = calculateCost(totalInputTokens, totalOutputTokens, lastModel);
+      const costFooter = formatCostFooter(totalInputTokens, totalOutputTokens, cost, durationMs, lastModel);
+      const responseWithCost = channel === 'voice' ? textResponse : `${textResponse}\n\n${costFooter}`;
+
+      await respondToUser(phone, responseWithCost, language, channel);
+      await storeMessage(conversation.id, 'assistant', textResponse); // Store without cost footer
 
       // Dashboard event: message sent
       dashboardBus.publish({ type: 'message_out', data: { phone, preview: textResponse.slice(0, 100), conversationId: conversation.id } });
@@ -411,8 +447,11 @@ async function _processMessageInner(phone: string, incomingMessage: string, chan
         conversationId: conversation.id,
         depth: currentDepth,
         iterations,
-        durationMs: Date.now() - startTime,
-        tokensUsed: response.usage.inputTokens + response.usage.outputTokens,
+        durationMs,
+        inputTokens: totalInputTokens,
+        outputTokens: totalOutputTokens,
+        cost: `$${cost.toFixed(4)}`,
+        model: lastModel,
       });
 
       // Clean up tool loop history for this conversation
