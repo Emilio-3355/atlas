@@ -97,31 +97,34 @@ export async function processVoiceInput(callSid: string, callerNumber: string, s
   if (meta) meta.lastActivity = new Date();
 
   try {
+    const startMs = Date.now();
+
     // Normalize to canonical user ID — shares conversation with WhatsApp/Telegram
     const conversationPhone = normalizeUserPhone(callerNumber, 'voice');
     const language = detectMessageLanguage(speechText);
 
-    // Get shared conversation from DB (same one used by Telegram/WhatsApp)
+    // SPEED: Run conversation fetch + context build in parallel (don't block on storeMessage)
     const conversation = await getOrCreateConversation(conversationPhone, language);
 
-    // Store voice input in shared DB
-    await storeMessage(conversation.id, 'user', speechText);
-
+    // Fire-and-forget: store input + dashboard event (don't wait)
+    storeMessage(conversation.id, 'user', speechText).catch(() => {});
     dashboardBus.publish({
       type: 'message_in',
       data: { phone: conversationPhone, preview: `[📞 Voice] ${speechText.slice(0, 80)}`, conversationId: conversation.id },
     });
 
-    // Load shared context — memory facts, behavioral rules, learnings
-    const recentMessages = await getRecentMessages(conversation.id, 20);
-    const contextResult = await buildContext(speechText);
+    // SPEED: Load messages + context in parallel, fewer messages (6 not 20)
+    const [recentMessages, contextResult] = await Promise.all([
+      getRecentMessages(conversation.id, 6),
+      buildContext(speechText),
+    ]);
 
-    // Compaction check (shared conversation may have grown from other channels)
-    if (await shouldCompact(conversation.id)) {
-      await compactConversation(conversation.id);
-    }
+    // SPEED: Skip compaction during voice — do it async
+    shouldCompact(conversation.id).then(need => {
+      if (need) compactConversation(conversation.id).catch(() => {});
+    }).catch(() => {});
 
-    // Build the SAME system prompt as Telegram/WhatsApp + voice addendum
+    // Build lean voice prompt
     const callMeta = activeCalls.get(callSid);
     let voiceContext = VOICE_ADDENDUM;
     if (callMeta?.outbound && callMeta.outboundPurpose) {
@@ -146,23 +149,25 @@ export async function processVoiceInput(callSid: string, callerNumber: string, s
       }))
     );
 
-    // Call Claude — same client as all other channels
+    // SPEED: Use Haiku for voice — much faster than Sonnet, good enough for short replies
     const response = await callClaude({
       messages: claudeMessages,
       system: systemPrompt,
-      depth: 'fast',
-      maxTokens: 256,
+      depth: 'voice',
+      maxTokens: 150,
     });
 
     const text = extractTextContent(response.content);
     const cleaned = cleanForSpeech(text || "I didn't quite catch that. Could you say it again?");
 
-    // Store response in shared DB
-    await storeMessage(conversation.id, 'assistant', cleaned);
-    await query(
-      'UPDATE conversations SET message_count = message_count + 2, updated_at = NOW(), language = $1 WHERE id = $2',
-      [language, conversation.id],
-    );
+    // SPEED: Store response async — don't block the reply to the caller
+    Promise.all([
+      storeMessage(conversation.id, 'assistant', cleaned),
+      query(
+        'UPDATE conversations SET message_count = message_count + 2, updated_at = NOW(), language = $1 WHERE id = $2',
+        [language, conversation.id],
+      ),
+    ]).catch((err) => logger.debug('Voice async DB write failed', { error: err }));
 
     if (meta) meta.turnCount++;
 
@@ -171,11 +176,13 @@ export async function processVoiceInput(callSid: string, callerNumber: string, s
       data: { phone: conversationPhone, preview: `[📞 Voice] ${cleaned.slice(0, 80)}`, conversationId: conversation.id },
     });
 
+    const latencyMs = Date.now() - startMs;
     logger.info('Voice turn processed', {
       callSid,
       conversationId: conversation.id,
       inputLen: speechText.length,
       outputLen: cleaned.length,
+      latencyMs,
       tokens: response.usage.inputTokens + response.usage.outputTokens,
     });
 

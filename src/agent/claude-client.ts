@@ -36,6 +36,7 @@ interface ClaudeResponse {
 }
 
 const MODEL_CONFIG: Record<ReasoningDepth, { model: string; maxTokens: number }> = {
+  voice: { model: 'claude-haiku-4-5-20251001', maxTokens: 256 },
   fast: { model: 'claude-sonnet-4-6', maxTokens: 2048 },
   deep: { model: 'claude-sonnet-4-6', maxTokens: 8192 },
   expert: { model: 'claude-opus-4-6', maxTokens: 16384 },
@@ -56,7 +57,8 @@ const RETRY_DELAYS = [1000, 3000]; // ms
  * API is used as fallback when daemon is offline, fails, or tools are genuinely needed.
  */
 export async function callClaude(req: ClaudeRequest): Promise<ClaudeResponse> {
-  const canTryDaemon = isDaemonOnline() && !hasImages(req.messages);
+  // Skip daemon for voice — direct API is faster (daemon adds CLI overhead)
+  const canTryDaemon = isDaemonOnline() && !hasImages(req.messages) && req.depth !== 'voice';
 
   if (canTryDaemon) {
     try {
@@ -136,8 +138,8 @@ async function callClaudeViaDaemon(req: ClaudeRequest): Promise<ClaudeResponse |
 
   const prompt = parts.join('\n\n');
 
-  // Scale timeout by depth: fast=60s, deep=120s, expert=180s
-  const timeout = req.depth === 'fast' ? 60 : req.depth === 'deep' ? 120 : 180;
+  // Scale timeout by depth: voice=15s, fast=60s, deep=120s, expert=180s
+  const timeout = req.depth === 'voice' ? 15 : req.depth === 'fast' ? 60 : req.depth === 'deep' ? 120 : 180;
 
   logger.info('Routing through daemon (Max subscription)', {
     depth: req.depth,
@@ -191,8 +193,8 @@ async function callClaudeViaAPI(req: ClaudeRequest): Promise<ClaudeResponse> {
     params.max_tokens = maxTokens + Math.floor(maxTokens * 0.6);
   }
 
-  // Timeout per depth: fast=60s, deep=120s, expert=180s
-  const timeoutMs = req.depth === 'fast' ? 60_000 : req.depth === 'deep' ? 120_000 : 180_000;
+  // Timeout per depth: voice=15s, fast=60s, deep=120s, expert=180s
+  const timeoutMs = req.depth === 'voice' ? 15_000 : req.depth === 'fast' ? 60_000 : req.depth === 'deep' ? 120_000 : 180_000;
 
   // Retry with exponential backoff for transient errors
   let lastError: Error | null = null;

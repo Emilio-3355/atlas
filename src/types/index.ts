@@ -2,7 +2,7 @@
 
 export type TrustLevel = 'owner' | 'system' | 'semi-trusted' | 'untrusted' | 'hostile';
 
-export type ReasoningDepth = 'fast' | 'deep' | 'expert';
+export type ReasoningDepth = 'voice' | 'fast' | 'deep' | 'expert';
 
 export type ToolCategory = 'informational' | 'action' | 'sensitive';
 
