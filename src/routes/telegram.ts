@@ -45,6 +45,19 @@ telegramRouter.post('/', async (c) => {
     let text: string | null = null;
     let images: ImageAttachment[] | undefined;
 
+    // Extract quoted/replied message text so Atlas can see what JP is replying to
+    let replyContext = '';
+    if (message.reply_to_message) {
+      const replied = message.reply_to_message;
+      const repliedText = replied.text || replied.caption || '';
+      if (repliedText.trim()) {
+        // Identify who sent the original message
+        const repliedFrom = replied.from?.is_bot ? 'Atlas' : 'JP';
+        replyContext = `[Replying to ${repliedFrom}: "${repliedText.slice(0, 500)}"]\n\n`;
+        logger.debug('Reply context extracted', { repliedFrom, length: repliedText.length });
+      }
+    }
+
     if (message.text) {
       text = message.text;
     } else if (message.voice || message.audio || message.video_note) {
@@ -114,6 +127,11 @@ telegramRouter.post('/', async (c) => {
 
     if (!text?.trim()) {
       return c.json({ ok: true });
+    }
+
+    // Prepend reply context so Atlas sees what message JP is replying to
+    if (replyContext) {
+      text = replyContext + text;
     }
 
     logger.info('Incoming Telegram message', {
