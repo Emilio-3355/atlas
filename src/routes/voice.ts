@@ -4,6 +4,8 @@ import {
   getOrCreateCall,
   processVoiceInput,
   getGreeting,
+  getOutboundGreeting,
+  getCallMeta,
   endCall,
   isGoodbye,
 } from '../services/voice-call.js';
@@ -96,6 +98,37 @@ voiceRouter.post('/respond', async (c) => {
 
   // Fallback if caller stops talking
   twiml.say({ voice: ATLAS_VOICE, language: LANGUAGE }, 'Anything else I can help with?');
+  twiml.redirect({ method: 'POST' }, '/voice/incoming');
+
+  return c.text(twiml.toString(), 200, { 'Content-Type': 'text/xml' });
+});
+
+// ─── Outbound Call (when recipient picks up) ────────────────────
+
+voiceRouter.post('/outbound', async (c) => {
+  const body = await c.req.parseBody();
+  const callSid = body['CallSid'] as string;
+  const calledNumber = body['To'] as string;
+
+  // Read purpose from query param (set by initiateOutboundCall)
+  const purpose = decodeURIComponent(c.req.query('purpose') || 'follow up on a matter');
+
+  logger.info('Outbound call answered', { callSid, to: calledNumber, purpose: purpose.slice(0, 100) });
+
+  // Ensure call metadata exists (should have been pre-registered)
+  const meta = getCallMeta(callSid);
+  if (!meta) {
+    getOrCreateCall(callSid, calledNumber);
+  }
+
+  const greeting = getOutboundGreeting(purpose);
+
+  const twiml = new VoiceResponse();
+  const gather = addGather(twiml);
+  gather.say({ voice: ATLAS_VOICE, language: LANGUAGE }, greeting);
+
+  // Fallback if they don't speak
+  twiml.say({ voice: ATLAS_VOICE, language: LANGUAGE }, 'Are you still there?');
   twiml.redirect({ method: 'POST' }, '/voice/incoming');
 
   return c.text(twiml.toString(), 200, { 'Content-Type': 'text/xml' });

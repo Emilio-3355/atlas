@@ -150,6 +150,14 @@ export async function registerBuiltInToolsAsync(): Promise<void> {
     logger.warn('Failed to load voice reply tool', { error: err });
   }
 
+  // Register outbound calling tool
+  try {
+    const callMod = await import('./built-in/make-call.js');
+    if (callMod.makeCallTool) reg.register(callMod.makeCallTool);
+  } catch (err) {
+    logger.warn('Failed to load make call tool', { error: err });
+  }
+
   // Register filesystem tool
   try {
     const fsMod = await import('./built-in/filesystem.js');

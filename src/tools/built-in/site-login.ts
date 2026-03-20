@@ -368,10 +368,25 @@ export const siteLoginTool: ToolDefinition = {
           // Navigate to login page (use MFA-aware timeout for Columbia)
           logger.info('site_login: navigating', { site: siteId, url: loginUrl });
           await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
-          await page.waitForTimeout(2000);
 
-          // Auto-detect and fill the login form
-          const fillResult = await autoFillLoginForm(page, creds.username, creds.password);
+          // Wait for SAML/SSO redirect to complete (e.g. courseworks → CAS)
+          // Poll until the URL changes away from the SAML endpoint or a login form appears
+          for (let i = 0; i < 15; i++) {
+            await page.waitForTimeout(2000);
+            const currentUrl = page.url();
+            // If we've left the SAML redirect page, the destination has loaded
+            if (currentUrl.includes('cas.columbia.edu') || !currentUrl.includes('/login/saml')) break;
+          }
+          await page.waitForTimeout(2000); // Extra buffer for CAS page to render
+
+          // Retry form detection — CAS or other SSO pages may take time to render
+          let fillResult: { filled: boolean; error?: string } = { filled: false };
+          for (let attempt = 0; attempt < 3; attempt++) {
+            fillResult = await autoFillLoginForm(page, creds.username, creds.password);
+            if (fillResult.filled) break;
+            logger.info('site_login: form not found yet, retrying', { attempt: attempt + 1, url: page.url() });
+            await page.waitForTimeout(3000);
+          }
 
           if (!fillResult.filled) {
             // Take screenshot for debugging

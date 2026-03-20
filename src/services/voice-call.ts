@@ -26,6 +26,8 @@ interface CallMeta {
   startedAt: Date;
   lastActivity: Date;
   turnCount: number;
+  outbound?: boolean;
+  outboundPurpose?: string;
 }
 
 const activeCalls = new Map<string, CallMeta>();
@@ -120,6 +122,12 @@ export async function processVoiceInput(callSid: string, callerNumber: string, s
     }
 
     // Build the SAME system prompt as Telegram/WhatsApp + voice addendum
+    const callMeta = activeCalls.get(callSid);
+    let voiceContext = VOICE_ADDENDUM;
+    if (callMeta?.outbound && callMeta.outboundPurpose) {
+      voiceContext += `\n\n## OUTBOUND CALL CONTEXT\nYou initiated this call on JP's behalf. Your purpose: ${callMeta.outboundPurpose}\nStay focused on this purpose. Be polite, professional, and concise. When you have the information you need, thank them and say goodbye.`;
+    }
+
     const systemPrompt = buildSystemPrompt({
       language,
       conversationSummary: conversation.summary || undefined,
@@ -128,7 +136,7 @@ export async function processVoiceInput(callSid: string, callerNumber: string, s
       behavioralRules: contextResult.behavioralRules || undefined,
       availableTools: [], // No tools during voice (too slow)
       currentTime: new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }),
-    }) + VOICE_ADDENDUM;
+    }) + voiceContext;
 
     // Sanitize conversation history for Claude API
     const claudeMessages = sanitizeMessages(
@@ -204,8 +212,8 @@ export async function endCall(callSid: string): Promise<void> {
   const durationSec = Math.round((Date.now() - meta.startedAt.getTime()) / 1000);
   logger.info('Voice call ended', { callSid, caller: meta.callerNumber, isJP: meta.isJP, durationSec, turns: meta.turnCount });
 
-  // Notify JP about calls from other people
-  if (!meta.isJP && meta.turnCount > 0) {
+  // Notify JP about outbound calls and calls from other people
+  if (meta.turnCount > 0 && (meta.outbound || !meta.isJP)) {
     try {
       // Get the conversation transcript from DB (shared history)
       const conversationPhone = normalizeUserPhone(meta.callerNumber, 'voice');
@@ -221,7 +229,9 @@ export async function endCall(callSid: string): Promise<void> {
       const mins = Math.floor(durationSec / 60);
       const secs = durationSec % 60;
       const duration = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
-      const notification = `📞 *Call from ${meta.callerNumber}* (${duration})\n\n${transcript.slice(0, 1000)}`;
+      const callType = meta.outbound ? `Outbound call to` : `Call from`;
+      const purposeLine = meta.outbound && meta.outboundPurpose ? `\nPurpose: ${meta.outboundPurpose}` : '';
+      const notification = `📞 *${callType} ${meta.callerNumber}* (${duration})${purposeLine}\n\n${transcript.slice(0, 1000)}`;
 
       await sendWhatsAppMessage(getEnv().JP_PHONE_NUMBER, notification);
       logger.info('Notified JP about voice call', { callSid });
@@ -235,6 +245,59 @@ export async function endCall(callSid: string): Promise<void> {
 
 export function getActiveCallCount(): number {
   return activeCalls.size;
+}
+
+// ─── Outbound Calls ─────────────────────────────────────────────
+
+/**
+ * Initiate an outbound call via Twilio. When the recipient picks up,
+ * Twilio hits /voice/outbound which greets them with the purpose context.
+ */
+export async function initiateOutboundCall(
+  targetPhone: string,
+  fromNumber: string,
+  purpose: string,
+): Promise<string> {
+  const twilio = await import('twilio');
+  const env = getEnv();
+  const client = twilio.default(env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN);
+
+  const baseUrl = env.BASE_URL;
+
+  // Encode purpose in the webhook URL so the outbound handler can read it
+  const purposeEncoded = encodeURIComponent(purpose);
+  const call = await client.calls.create({
+    to: targetPhone,
+    from: fromNumber,
+    url: `${baseUrl}/voice/outbound?purpose=${purposeEncoded}`,
+    statusCallback: `${baseUrl}/voice/status`,
+    statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
+    statusCallbackMethod: 'POST',
+  });
+
+  // Pre-register the call metadata so the outbound handler has context
+  const meta: CallMeta = {
+    callSid: call.sid,
+    callerNumber: targetPhone,
+    isJP: false,
+    startedAt: new Date(),
+    lastActivity: new Date(),
+    turnCount: 0,
+    outbound: true,
+    outboundPurpose: purpose,
+  };
+  activeCalls.set(call.sid, meta);
+
+  logger.info('Outbound call initiated', { callSid: call.sid, to: targetPhone, purpose: purpose.slice(0, 100) });
+  return call.sid;
+}
+
+export function getOutboundGreeting(purpose: string): string {
+  return `Hi, this is Atlas calling on behalf of JP. ${purpose}`;
+}
+
+export function getCallMeta(callSid: string): CallMeta | undefined {
+  return activeCalls.get(callSid);
 }
 
 /** Check if speech sounds like a goodbye */
