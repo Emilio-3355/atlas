@@ -1,10 +1,15 @@
 import type { ToolDefinition, ToolResult, ToolContext } from '../../types/index.js';
 import { takeScreenshot } from '../../services/browser.js';
+import { sendImage } from '../../agent/responder.js';
+import { getEnv } from '../../config/env.js';
 import logger from '../../utils/logger.js';
+import fs from 'fs';
+import path from 'path';
+import crypto from 'crypto';
 
 export const screenshotTool: ToolDefinition = {
   name: 'screenshot',
-  description: 'Take a screenshot of a web page and send it to JP via WhatsApp. Use for showing restaurant pages, search results, booking forms, etc.',
+  description: 'Take a screenshot of a web page and send it to JP. Use for showing restaurant pages, search results, booking forms, maps, or any visual content.',
   category: 'informational',
   requiresApproval: false,
   inputSchema: {
@@ -22,18 +27,31 @@ export const screenshotTool: ToolDefinition = {
     try {
       const buffer = await takeScreenshot(input.url);
 
-      // For WhatsApp, we need a publicly accessible URL
-      // In production, upload to a temporary storage and return URL
-      // For now, base64 encode
-      const base64 = buffer.toString('base64');
+      // Save to temp file and serve via public URL
+      const filename = `screenshot_${crypto.randomBytes(8).toString('hex')}.png`;
+      const tempDir = '/tmp/atlas-screenshots';
+      if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
+      const filePath = path.join(tempDir, filename);
+      fs.writeFileSync(filePath, buffer);
+
+      const baseUrl = getEnv().BASE_URL;
+      const mediaUrl = `${baseUrl}/media/img/${filename}`;
+
+      // Send the screenshot directly to JP
+      await sendImage(ctx.userPhone, mediaUrl, input.caption || input.url, ctx.channel);
+
+      // Clean up after 10 minutes
+      setTimeout(() => {
+        try { fs.unlinkSync(filePath); } catch {}
+      }, 10 * 60 * 1000);
 
       return {
         success: true,
         data: {
-          screenshot: `data:image/png;base64,${base64}`,
+          message: 'Screenshot sent to JP',
           url: input.url,
           caption: input.caption,
-          size: buffer.length,
+          sizeKb: Math.round(buffer.length / 1024),
         },
       };
     } catch (err) {

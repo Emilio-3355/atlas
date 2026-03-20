@@ -64,6 +64,25 @@ app.get('/media/voice/:filename', async (c) => {
   }
 });
 
+// Serve screenshot images temporarily (for Twilio/Telegram media)
+app.get('/media/img/:filename', async (c) => {
+  const filename = c.req.param('filename');
+  if (!/^[a-zA-Z0-9_]+\.png$/.test(filename)) {
+    return c.text('Not found', 404);
+  }
+  const filePath = `/tmp/atlas-screenshots/${filename}`;
+  try {
+    const fs = await import('fs');
+    if (!fs.existsSync(filePath)) return c.text('Not found', 404);
+    const buffer = fs.readFileSync(filePath);
+    return new Response(buffer, {
+      headers: { 'Content-Type': 'image/png', 'Content-Length': String(buffer.length) },
+    });
+  } catch {
+    return c.text('Not found', 404);
+  }
+});
+
 // Root
 app.get('/', (c) => c.json({ name: 'Atlas', status: 'running', version: '1.0.0' }));
 
