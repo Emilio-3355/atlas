@@ -1,5 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
-import { callClaude, extractTextContent, extractToolUse, extractAllToolUse } from './claude-client.js';
+import { callClaude, extractTextContent, extractToolUse, extractAllToolUse, type ClaudeUsage } from './claude-client.js';
 import { buildSystemPrompt } from './system-prompt.js';
 import { determineDepth, escalateDepth } from './reasoner.js';
 import { detectMessageLanguage, respondToUser } from './responder.js';
@@ -24,25 +24,66 @@ import type { AgentContext, AgentResponse, ReasoningDepth, ToolContext, PendingA
 const MAX_TOOL_ITERATIONS = 10;
 
 // ─── Token Cost Tracking ────────────────────────────────────────
+// Pricing source: https://docs.anthropic.com/en/docs/about-claude/models
+// All prices per million tokens (MTok)
 
-// Anthropic pricing per million tokens (as of 2025)
-const MODEL_PRICING: Record<string, { input: number; output: number }> = {
-  'claude-sonnet-4-6': { input: 3, output: 15 },
-  'claude-opus-4-6':   { input: 15, output: 75 },
-  'claude-code-daemon': { input: 0, output: 0 },
+const MODEL_PRICING: Record<string, { input: number; output: number; cacheWrite: number; cacheRead: number }> = {
+  // Sonnet 4: $3 input, $15 output, cache write = 1.25x input, cache read = 0.1x input
+  'claude-sonnet-4-6':     { input: 3, output: 15, cacheWrite: 3.75, cacheRead: 0.30 },
+  'claude-sonnet-4-20250514': { input: 3, output: 15, cacheWrite: 3.75, cacheRead: 0.30 },
+  // Opus 4: $15 input, $75 output, cache write = 1.25x input, cache read = 0.1x input
+  'claude-opus-4-6':       { input: 15, output: 75, cacheWrite: 18.75, cacheRead: 1.50 },
+  'claude-opus-4-20250514':  { input: 15, output: 75, cacheWrite: 18.75, cacheRead: 1.50 },
+  // Daemon (Max plan): free
+  'claude-code-daemon':    { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 },
 };
 
-function calculateCost(inputTokens: number, outputTokens: number, model: string): number {
-  const p = MODEL_PRICING[model] || MODEL_PRICING['claude-sonnet-4-6'];
-  return (inputTokens * p.input + outputTokens * p.output) / 1_000_000;
+interface AccumulatedUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
 }
 
-function formatCostFooter(inputTokens: number, outputTokens: number, cost: number, durationMs: number, model: string): string {
-  const costStr = cost < 0.01 ? `$${cost.toFixed(4)}` : `$${cost.toFixed(3)}`;
-  const totalTokens = inputTokens + outputTokens;
+/**
+ * Calculate cost using EXACT Anthropic billing rules:
+ * - input_tokens: billed at input rate (note: this is total input MINUS cache reads)
+ * - output_tokens: billed at output rate
+ * - cache_creation_input_tokens: billed at 1.25x input rate
+ * - cache_read_input_tokens: billed at 0.1x input rate
+ *
+ * The API's input_tokens already INCLUDES cache_read tokens in the count,
+ * so non-cached input = input_tokens - cache_read_tokens
+ */
+function calculateCost(usage: AccumulatedUsage, model: string): number {
+  const p = MODEL_PRICING[model] || MODEL_PRICING['claude-sonnet-4-6'];
+
+  // Non-cached input tokens (API's input_tokens includes cache reads, subtract them)
+  const regularInput = Math.max(0, usage.inputTokens - usage.cacheReadTokens);
+
+  const cost =
+    (regularInput * p.input / 1_000_000) +
+    (usage.outputTokens * p.output / 1_000_000) +
+    (usage.cacheCreationTokens * p.cacheWrite / 1_000_000) +
+    (usage.cacheReadTokens * p.cacheRead / 1_000_000);
+
+  return cost;
+}
+
+function formatCostFooter(usage: AccumulatedUsage, cost: number, durationMs: number, model: string): string {
+  const costStr = cost < 0.001 ? `$${cost.toFixed(5)}` : cost < 0.01 ? `$${cost.toFixed(4)}` : `$${cost.toFixed(3)}`;
+  const totalTokens = usage.inputTokens + usage.outputTokens;
   const seconds = (durationMs / 1000).toFixed(1);
   const modelShort = model.includes('opus') ? 'opus' : model.includes('daemon') ? 'free' : 'sonnet';
-  return `_⚡ ${totalTokens.toLocaleString()} tokens (${inputTokens.toLocaleString()}↑ ${outputTokens.toLocaleString()}↓) · ${costStr} · ${seconds}s · ${modelShort}_`;
+
+  let parts = `${totalTokens.toLocaleString()} tok (${usage.inputTokens.toLocaleString()}↑ ${usage.outputTokens.toLocaleString()}↓)`;
+
+  // Show cache hits if any
+  if (usage.cacheReadTokens > 0) {
+    parts += ` · ${usage.cacheReadTokens.toLocaleString()} cached`;
+  }
+
+  return `_⚡ ${parts} · ${costStr} · ${seconds}s · ${modelShort}_`;
 }
 
 /**
@@ -301,8 +342,7 @@ async function _processMessageInner(phone: string, incomingMessage: string, chan
   let iterations = 0;
   let currentMessages = [...claudeMessages];
   const toolsUsed: string[] = [];
-  let totalInputTokens = 0;
-  let totalOutputTokens = 0;
+  const totalUsage: AccumulatedUsage = { inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
   let lastModel = '';
 
   while (iterations < MAX_TOOL_ITERATIONS) {
@@ -320,9 +360,11 @@ async function _processMessageInner(phone: string, incomingMessage: string, chan
       depth: currentDepth,
     });
 
-    // Accumulate token usage across all iterations
-    totalInputTokens += response.usage.inputTokens;
-    totalOutputTokens += response.usage.outputTokens;
+    // Accumulate token usage across all iterations (exact from API)
+    totalUsage.inputTokens += response.usage.inputTokens;
+    totalUsage.outputTokens += response.usage.outputTokens;
+    totalUsage.cacheCreationTokens += response.usage.cacheCreationTokens;
+    totalUsage.cacheReadTokens += response.usage.cacheReadTokens;
     lastModel = response.model;
 
     // Check for tool use — handle ALL tool_use blocks in the response
@@ -425,10 +467,10 @@ async function _processMessageInner(phone: string, incomingMessage: string, chan
     const textResponse = extractTextContent(response.content);
 
     if (textResponse) {
-      // Append cost footer for text channels (not voice — would be spoken)
+      // Calculate exact cost from API-reported token counts
       const durationMs = Date.now() - startTime;
-      const cost = calculateCost(totalInputTokens, totalOutputTokens, lastModel);
-      const costFooter = formatCostFooter(totalInputTokens, totalOutputTokens, cost, durationMs, lastModel);
+      const cost = calculateCost(totalUsage, lastModel);
+      const costFooter = formatCostFooter(totalUsage, cost, durationMs, lastModel);
       const responseWithCost = channel === 'voice' ? textResponse : `${textResponse}\n\n${costFooter}`;
 
       await respondToUser(phone, responseWithCost, language, channel);
@@ -448,8 +490,10 @@ async function _processMessageInner(phone: string, incomingMessage: string, chan
         depth: currentDepth,
         iterations,
         durationMs,
-        inputTokens: totalInputTokens,
-        outputTokens: totalOutputTokens,
+        inputTokens: totalUsage.inputTokens,
+        outputTokens: totalUsage.outputTokens,
+        cacheRead: totalUsage.cacheReadTokens,
+        cacheWrite: totalUsage.cacheCreationTokens,
         cost: `$${cost.toFixed(4)}`,
         model: lastModel,
       });

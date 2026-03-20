@@ -21,10 +21,17 @@ interface ClaudeRequest {
   maxTokens?: number;
 }
 
+export interface ClaudeUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens: number;  // tokens written to cache (billed at 1.25x input)
+  cacheReadTokens: number;      // tokens read from cache (billed at 0.1x input)
+}
+
 interface ClaudeResponse {
   content: Anthropic.ContentBlock[];
   stopReason: string | null;
-  usage: { inputTokens: number; outputTokens: number };
+  usage: ClaudeUsage;
   model: string;
 }
 
@@ -118,7 +125,7 @@ async function callClaudeViaDaemon(req: ClaudeRequest): Promise<ClaudeResponse |
   return {
     content: [{ type: 'text', text: result.output.trim(), citations: null } as unknown as Anthropic.ContentBlock],
     stopReason: 'end_turn',
-    usage: { inputTokens: 0, outputTokens: 0 }, // No API cost!
+    usage: { inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 }, // No API cost!
     model: 'claude-code-daemon',
   };
 }
@@ -169,7 +176,12 @@ async function callClaudeViaAPI(req: ClaudeRequest): Promise<ClaudeResponse> {
       return {
         content: response.content,
         stopReason: response.stop_reason,
-        usage: { inputTokens: response.usage.input_tokens, outputTokens: response.usage.output_tokens },
+        usage: {
+          inputTokens: response.usage.input_tokens,
+          outputTokens: response.usage.output_tokens,
+          cacheCreationTokens: response.usage.cache_creation_input_tokens || 0,
+          cacheReadTokens: response.usage.cache_read_input_tokens || 0,
+        },
         model: response.model,
       };
     } catch (err: any) {
