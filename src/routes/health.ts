@@ -59,14 +59,14 @@ function debugAuth(c: any): boolean {
   return provided === token;
 }
 
-// Debug: dump conversation messages for the most recent active conversation (any channel)
+// Debug: dump conversation messages for a specific or most recent conversation
 healthRouter.get('/debug/messages', async (c) => {
   if (!debugAuth(c)) return c.json({ error: 'Unauthorized' }, 401);
   try {
-    const conv = await query(
-      `SELECT * FROM conversations WHERE status = 'active'
-       ORDER BY updated_at DESC LIMIT 1`
-    );
+    const phoneFilter = c.req.query('phone');
+    const conv = phoneFilter
+      ? await query(`SELECT * FROM conversations WHERE user_phone = $1 AND status = 'active' ORDER BY updated_at DESC LIMIT 1`, [phoneFilter])
+      : await query(`SELECT * FROM conversations WHERE status = 'active' ORDER BY message_count DESC, updated_at DESC LIMIT 1`);
     if (conv.rows.length === 0) return c.json({ error: 'No active telegram conversation' });
 
     const convId = conv.rows[0].id;
