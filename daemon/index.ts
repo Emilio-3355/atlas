@@ -223,6 +223,50 @@ function sendDone(id: string, success: boolean, output: string, exitCode: number
 
 // --- Connection ---
 
+// Client-side liveness: if we don't hear from server in 90s, connection is dead
+const LIVENESS_TIMEOUT = 90_000;
+let lastServerMessage = 0;
+let livenessTimer: ReturnType<typeof setInterval> | null = null;
+// Client-side ping: send our own pings every 25s to keep the connection alive
+const CLIENT_PING_INTERVAL = 25_000;
+let clientPingTimer: ReturnType<typeof setInterval> | null = null;
+
+function startLivenessCheck(): void {
+  stopLivenessCheck();
+  lastServerMessage = Date.now();
+
+  // Send client-side pings to keep connection alive (prevents Railway idle timeout)
+  clientPingTimer = setInterval(() => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.ping(); // WebSocket protocol-level ping
+    }
+  }, CLIENT_PING_INTERVAL);
+
+  // Check every 30s if we've heard from server recently
+  livenessTimer = setInterval(() => {
+    const silenceMs = Date.now() - lastServerMessage;
+    if (silenceMs > LIVENESS_TIMEOUT) {
+      log('warn', `No server message in ${Math.round(silenceMs / 1000)}s — connection likely dead, forcing reconnect`);
+      try { ws?.terminate(); } catch {}
+      ws = null;
+      reconnectNow();
+    }
+  }, 30_000);
+}
+
+function stopLivenessCheck(): void {
+  if (livenessTimer) { clearInterval(livenessTimer); livenessTimer = null; }
+  if (clientPingTimer) { clearInterval(clientPingTimer); clientPingTimer = null; }
+}
+
+function reconnectNow(): void {
+  if (shouldReconnect) {
+    log('info', `Reconnecting in ${reconnectDelay / 1000}s...`);
+    setTimeout(connect, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX);
+  }
+}
+
 function connect(): void {
   log('info', `Connecting to ${WS_URL}...`);
 
@@ -243,6 +287,8 @@ function connect(): void {
   });
 
   ws.on('message', (raw) => {
+    lastServerMessage = Date.now(); // Track liveness
+
     let msg: any;
     try {
       msg = JSON.parse(raw.toString());
@@ -254,6 +300,7 @@ function connect(): void {
     // Auth response
     if (msg.type === 'auth_ok') {
       log('info', 'Authenticated successfully');
+      startLivenessCheck(); // Start monitoring AFTER auth succeeds
       return;
     }
 
@@ -294,19 +341,21 @@ function connect(): void {
     }
   });
 
+  // WebSocket pong from server (response to our protocol-level ping)
+  ws.on('pong', () => {
+    lastServerMessage = Date.now();
+  });
+
   ws.on('close', (code, reason) => {
     log('info', `Disconnected: ${code} ${reason.toString()}`);
+    stopLivenessCheck();
     ws = null;
-
-    if (shouldReconnect) {
-      log('info', `Reconnecting in ${reconnectDelay / 1000}s...`);
-      setTimeout(connect, reconnectDelay);
-      reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX);
-    }
+    reconnectNow();
   });
 
   ws.on('error', (err) => {
     log('error', `WebSocket error: ${err.message}`);
+    // Don't reconnect here — 'close' event will fire after 'error'
   });
 }
 
@@ -315,6 +364,7 @@ function connect(): void {
 process.on('SIGTERM', () => {
   log('info', 'SIGTERM received');
   shouldReconnect = false;
+  stopLivenessCheck();
   ws?.close(1000, 'Daemon stopping');
   process.exit(0);
 });
@@ -322,8 +372,19 @@ process.on('SIGTERM', () => {
 process.on('SIGINT', () => {
   log('info', 'SIGINT received');
   shouldReconnect = false;
+  stopLivenessCheck();
   ws?.close(1000, 'Daemon stopping');
   process.exit(0);
+});
+
+// Catch unhandled errors so daemon doesn't silently die
+process.on('uncaughtException', (err) => {
+  log('error', `Uncaught exception: ${err.message}`, { stack: err.stack });
+  // Don't exit — let launchctl KeepAlive handle restart if needed
+});
+
+process.on('unhandledRejection', (reason) => {
+  log('error', `Unhandled rejection: ${reason}`);
 });
 
 // --- Start ---
