@@ -78,6 +78,19 @@ async function initCookies(): Promise<void> {
 // Initialize cookies on module load
 initCookies().catch(() => {});
 
+/** Clear stored cookies for a domain (memory + disk) */
+export async function clearCookies(domain: string): Promise<void> {
+  storedCookies.delete(domain);
+  try {
+    const filePath = path.join(COOKIE_DIR, `${domain}.json`);
+    const { unlink } = await import('fs/promises');
+    await unlink(filePath);
+    logger.info('Cleared cookies', { domain });
+  } catch {
+    // File didn't exist — that's fine
+  }
+}
+
 // ─── Session Persistence ─────────────────────────────────────────
 // Keeps browser pages alive between tool calls so multi-step tasks
 // (e.g., login → navigate → fill form) don't lose state.

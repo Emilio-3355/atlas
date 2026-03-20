@@ -1,5 +1,5 @@
 import type { ToolDefinition, ToolResult, ToolContext } from '../../types/index.js';
-import { createPageWithCookies, safeClosePage, saveCookies } from '../../services/browser.js';
+import { createPageWithCookies, safeClosePage, saveCookies, clearCookies } from '../../services/browser.js';
 import { query } from '../../config/database.js';
 import { tagContent } from '../../security/content-trust.js';
 import { encryptIfAvailable, decryptGraceful } from '../../security/crypto.js';
@@ -388,21 +388,52 @@ export const siteLoginTool: ToolDefinition = {
             await page.waitForTimeout(3000);
           }
 
+          let currentUrl = page.url();
+          let pageText = '';
+
           if (!fillResult.filled) {
-            // Take screenshot for debugging
-            const screenshotBuf = await page.screenshot({ type: 'png' }).catch(() => null);
-            await safeClosePage(page);
-            return {
-              success: false,
-              error: `Could not find login form on ${loginUrl}. ${fillResult.error || 'No username/password fields detected.'}`,
-            };
+            // Before giving up, check if cookies already got us past login (e.g. straight to Duo/MFA)
+            currentUrl = page.url();
+            pageText = await page.evaluate('(document.body?.innerText || "").slice(0, 3000)') as string;
+            const alreadyPastLogin = currentUrl.includes('duo') ||
+              currentUrl.includes('duosecurity.com') ||
+              pageText.toLowerCase().includes('two-factor') ||
+              pageText.toLowerCase().includes('send me a push') ||
+              pageText.toLowerCase().includes('push notification') ||
+              pageText.toLowerCase().includes('authenticator');
+
+            // Also check if we're already fully logged in (no form needed at all)
+            const alreadyLoggedIn = !currentUrl.includes('cas.columbia.edu') &&
+              !currentUrl.includes('/login') &&
+              !currentUrl.includes('duo') &&
+              (currentUrl.includes('courseworks2') || currentUrl.includes('vergil') || currentUrl.includes('mail.google.com'));
+
+            if (!alreadyPastLogin && !alreadyLoggedIn) {
+              // Truly can't find login form and not on MFA page — clear cookies and fail
+              const screenshotBuf = await page.screenshot({ type: 'png' }).catch(() => null);
+              await safeClosePage(page);
+              // Clear bad cookies so next attempt starts fresh
+              await clearCookies(cookieDomain).catch(() => {});
+              return {
+                success: false,
+                error: `Could not find login form on ${loginUrl}. ${fillResult.error || 'No username/password fields detected.'}`,
+              };
+            }
+
+            if (alreadyLoggedIn) {
+              logger.info('site_login: cookies got us fully logged in — no form or MFA needed', { url: currentUrl });
+              // Skip straight to content extraction (fall through past MFA block)
+            } else {
+              logger.info('site_login: cookies skipped login form — already on MFA/Duo page', { url: currentUrl });
+              // Fall through to MFA handling below
+            }
+          } else {
+            // Wait for navigation after submit
+            await page.waitForTimeout(4000);
           }
 
-          // Wait for navigation after submit
-          await page.waitForTimeout(4000);
-
-          let currentUrl = page.url();
-          let pageText = await page.evaluate('(document.body?.innerText || "").slice(0, 3000)') as string;
+          currentUrl = page.url();
+          pageText = await page.evaluate('(document.body?.innerText || "").slice(0, 3000)') as string;
 
           // Check for wrong credentials
           const loginFailed = pageText.toLowerCase().includes('login incorrect') ||
