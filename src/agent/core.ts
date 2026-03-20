@@ -12,6 +12,8 @@ import { sendTelegramTyping } from '../services/telegram.js';
 import { recordToolChain } from '../self-improvement/foundry.js';
 import { learnFromExecution } from '../self-improvement/learning-engine.js';
 import { checkToolPolicy } from '../security/tool-policies.js';
+import { upsertFact, getFact } from '../memory/structured.js';
+import { storeSemanticMemory } from '../memory/semantic.js';
 import { getEnv } from '../config/env.js';
 import { query } from '../config/database.js';
 import { dashboardBus } from '../services/dashboard-events.js';
@@ -84,27 +86,45 @@ function clearToolLoopHistory(conversationId: string) {
   toolCallHistory.delete(conversationId);
 }
 
-/** Truncate large tool results to prevent context overflow */
-function truncateToolResult(text: string, maxChars: number = 30000): string {
+/** Smart retry: modify tool input on retry to increase success chances */
+function getRetryInput(toolName: string, input: Record<string, any>, error: string, attempt: number): Record<string, any> {
+  if (toolName === 'web_search' && attempt > 0) {
+    // Simplify query: remove quotes, take first 5 words
+    return { ...input, query: (input.query || '').replace(/"/g, '').split(' ').slice(0, 5).join(' ') };
+  }
+  if (toolName === 'browse' && error.includes('timeout')) {
+    return { ...input, waitUntil: 'domcontentloaded' }; // faster than networkidle
+  }
+  return input; // no modification for unknown tools
+}
+
+/** Truncate or summarize large tool results to prevent context overflow */
+async function truncateToolResult(text: string, maxChars: number = 60000, toolName?: string): Promise<string> {
   if (text.length <= maxChars) return text;
 
-  const suffix = '\n\n[... content truncated ...]';
-  const budget = maxChars - suffix.length;
-
-  // Check if tail has important content (errors, JSON closing, summary)
-  const tail = text.slice(-2000);
-  const hasImportantTail = /\b(error|failed|summary|total|result)\b/i.test(tail);
-
-  if (hasImportantTail && budget > 4000) {
-    const tailBudget = Math.min(Math.floor(budget * 0.3), 4000);
-    const headBudget = budget - tailBudget;
-    const headCut = text.lastIndexOf('\n', headBudget) || headBudget;
-    const tailStart = Math.max(0, text.length - tailBudget);
-    return text.slice(0, headCut) + '\n\n[... middle content omitted ...]\n\n' + text.slice(tailStart);
+  // For very large results, try summarizing with Claude instead of hard-truncating
+  if (toolName) {
+    try {
+      const response = await callClaude({
+        messages: [{ role: 'user', content: `Summarize this ${toolName} output. Preserve all data points, errors, URLs, names, and numbers exactly:\n\n${text.slice(0, 100000)}` }],
+        system: 'Summarize precisely. Keep all facts, numbers, names, dates, URLs, errors.',
+        depth: 'fast',
+        maxTokens: 2048,
+      });
+      return `[Summarized — original was ${text.length} chars]\n${extractTextContent(response.content)}`;
+    } catch {
+      // Fall through to hard truncation
+    }
   }
 
-  const cut = text.lastIndexOf('\n', budget) || budget;
-  return text.slice(0, cut) + suffix;
+  // Fallback: smart truncation preserving tail
+  const tail = text.slice(-2000);
+  const hasImportantTail = /error|exception|total|summary|result|}\s*$/i.test(tail);
+
+  if (hasImportantTail) {
+    return text.slice(0, maxChars - 2200) + '\n...(truncated)...\n' + tail;
+  }
+  return text.slice(0, maxChars) + '\n...(truncated)';
 }
 
 export async function processMessage(phone: string, incomingMessage: string, channel: MessageChannel = 'whatsapp', images?: ImageAttachment[]): Promise<void> {
@@ -153,10 +173,10 @@ async function _processMessageInner(phone: string, incomingMessage: string, chan
   }
 
   // Load recent messages for context
-  const recentMessages = await getRecentMessages(conversation.id, 20);
+  const recentMessages = await getRecentMessages(conversation.id, 40);
 
-  // Build context from memory + learnings + behavioral rules
-  const contextResult = await buildContext(incomingMessage);
+  // Build context from memory + learnings + behavioral rules + past conversations
+  const contextResult = await buildContext(incomingMessage, conversationPhone);
   const relevantMemory = contextResult.memory;
   const relevantLearnings = contextResult.learnings;
   const behavioralRules = contextResult.behavioralRules;
@@ -333,18 +353,25 @@ async function _processMessageInner(phone: string, incomingMessage: string, chan
         });
       }
 
-      // Add assistant response (with all tool_use blocks) and ALL tool_results (truncated)
+      // Add assistant response (with all tool_use blocks) and ALL tool_results (truncated/summarized)
       currentMessages.push({
         role: 'assistant',
         content: response.content,
       });
-      currentMessages.push({
-        role: 'user',
-        content: toolResults.map((tr) => ({
+      const truncatedResults = await Promise.all(
+        toolResults.map(async (tr) => ({
           type: 'tool_result' as const,
           tool_use_id: tr.id,
-          content: truncateToolResult(JSON.stringify(tr.result.data || tr.result.error || 'Done')),
-        })),
+          content: await truncateToolResult(
+            JSON.stringify(tr.result.data || tr.result.error || 'Done'),
+            60000,
+            toolsUsed[toolResults.indexOf(tr)],
+          ),
+        }))
+      );
+      currentMessages.push({
+        role: 'user',
+        content: truncatedResults,
       });
 
       // Play-by-play: send brief status on 3rd+ tool iteration so user knows Atlas is working
@@ -401,6 +428,10 @@ async function _processMessageInner(phone: string, incomingMessage: string, chan
           conversation.id,
         ).catch((err) => logger.debug('Foundry recording skipped', { error: err }));
       }
+
+      // Auto-extract facts from user message (non-blocking)
+      extractAndStoreFacts(incomingMessage, conversation.id)
+        .catch((err) => logger.debug('Fact extraction skipped', { error: err }));
     }
 
     return;
@@ -425,6 +456,10 @@ export async function getOrCreateConversation(phone: string, language: string) {
 
   if (existing.rows.length > 0) return existing.rows[0];
 
+  // Old conversation expired — summarize stale ones in background
+  summarizeStaleConversations(phone)
+    .catch((err) => logger.debug('Stale conversation summarization skipped', { error: err }));
+
   // Create new conversation
   const result = await query(
     'INSERT INTO conversations (user_phone, language) VALUES ($1, $2) RETURNING *',
@@ -443,7 +478,8 @@ export async function storeMessage(conversationId: string, role: string, content
 export async function getRecentMessages(conversationId: string, limit: number = 20) {
   const result = await query(
     `SELECT role, content, tool_name, tool_input FROM messages
-     WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT $2`,
+     WHERE conversation_id = $1 AND (compacted IS NULL OR compacted = false)
+     ORDER BY created_at DESC LIMIT $2`,
     [conversationId, limit]
   );
   return result.rows.reverse();
@@ -594,7 +630,8 @@ async function executeToolCall(toolName: string, input: Record<string, any>, ctx
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      let result = await tool.execute(attempt === 0 ? preResult.input : input, ctx);
+      const retryInput = attempt === 0 ? preResult.input : getRetryInput(toolName, input, lastError, attempt);
+      let result = await tool.execute(retryInput, ctx);
 
       // Run post-tool hooks (can modify result)
       result = await hookManager.runPostToolHooks(hookCtx, result);
@@ -736,4 +773,164 @@ export function sanitizeMessages(messages: Anthropic.MessageParam[]): Anthropic.
   }
 
   return cleaned;
+}
+
+// ===== Auto Memory Extraction =====
+
+const TRIVIAL_PATTERNS = /^(ok|okay|thanks|thank you|gracias|si|sí|no|yes|got it|cool|nice|lol|haha|k|👍|🙏)$/i;
+
+/**
+ * Auto-extract structured facts from user messages using a fast Claude call.
+ * Skips trivial messages. Caps at 5 facts per message. Deduplicates before upserting.
+ */
+async function extractAndStoreFacts(userMessage: string, conversationId: string): Promise<void> {
+  // Skip trivial messages
+  const trimmed = userMessage.trim();
+  if (trimmed.length < 15) return;
+  if (TRIVIAL_PATTERNS.test(trimmed)) return;
+  // Skip pure questions (likely not stating facts)
+  if (/^(what|where|when|who|how|why|can you|could you|do you|is there|are there)\b/i.test(trimmed) && trimmed.endsWith('?')) return;
+
+  try {
+    const response = await callClaude({
+      messages: [{
+        role: 'user',
+        content: `Extract factual information from this message that should be remembered about the user. Only extract concrete facts (preferences, contacts, dates, personal details, plans, opinions). Do NOT extract questions, commands, or greetings.
+
+Message: "${trimmed}"
+
+Respond ONLY with a JSON array (or empty array [] if no facts). Each item: {"category": "string", "key": "string", "value": "string"}
+Categories: preference, contact, personal, schedule, location, work, finance, health, other
+Keys should be specific and unique (e.g., "favorite_restaurant", "brother_name", "gym_schedule").
+Max 5 facts. Be selective — only extract clearly stated information.`,
+      }],
+      system: 'You extract structured facts from messages. Respond with ONLY valid JSON, no explanation.',
+      depth: 'fast',
+      maxTokens: 512,
+    });
+
+    const text = extractTextContent(response.content).trim();
+    // Parse JSON — handle markdown code blocks
+    const jsonStr = text.replace(/^```json?\s*/, '').replace(/\s*```$/, '').trim();
+    let facts: Array<{ category: string; key: string; value: string }>;
+    try {
+      facts = JSON.parse(jsonStr);
+    } catch {
+      logger.debug('Fact extraction: invalid JSON response', { text: text.slice(0, 200) });
+      return;
+    }
+
+    if (!Array.isArray(facts) || facts.length === 0) return;
+
+    // Cap at 5 facts
+    const toProcess = facts.slice(0, 5);
+    let stored = 0;
+
+    for (const fact of toProcess) {
+      if (!fact.category || !fact.key || !fact.value) continue;
+
+      // Deduplication: skip if identical value already exists (Fix 5)
+      const existing = await getFact(fact.category, fact.key);
+      if (existing && existing.value === fact.value) continue;
+
+      await upsertFact(
+        fact.category,
+        fact.key,
+        fact.value,
+        'auto_extracted',
+        0.85, // lower confidence than explicit remember (1.0)
+        { conversationId, sourceMessage: trimmed.slice(0, 200) },
+      );
+
+      // Also store as semantic memory for cross-conversation recall
+      await storeSemanticMemory(
+        `[${fact.category}] ${fact.key}: ${fact.value}`,
+        'auto_extracted',
+        conversationId,
+        { factCategory: fact.category, factKey: fact.key },
+      );
+
+      stored++;
+    }
+
+    if (stored > 0) {
+      logger.info('Auto-extracted facts', { count: stored, conversationId });
+    }
+  } catch (err) {
+    logger.debug('Fact extraction failed', { error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+/**
+ * Summarize stale conversations (>2h old, no summary, 4+ messages).
+ * Runs in background when a new conversation is created.
+ */
+async function summarizeStaleConversations(phone: string): Promise<void> {
+  try {
+    const stale = await query(
+      `SELECT id, language FROM conversations
+       WHERE user_phone = $1 AND status = 'active'
+       AND summary IS NULL
+       AND updated_at < NOW() - INTERVAL '2 hours'
+       AND message_count >= 4
+       ORDER BY updated_at DESC LIMIT 3`,
+      [phone]
+    );
+
+    if (stale.rows.length === 0) return;
+
+    for (const conv of stale.rows) {
+      try {
+        // Get conversation messages (cap transcript at 8K chars)
+        const msgs = await query(
+          `SELECT role, content FROM messages
+           WHERE conversation_id = $1 AND (compacted IS NULL OR compacted = false)
+           ORDER BY created_at ASC LIMIT 50`,
+          [conv.id]
+        );
+
+        if (msgs.rows.length < 4) continue;
+
+        let transcript = msgs.rows
+          .map((m: any) => `${m.role}: ${m.content}`)
+          .join('\n');
+        if (transcript.length > 8000) {
+          transcript = transcript.slice(0, 8000) + '\n...(truncated)';
+        }
+
+        const response = await callClaude({
+          messages: [{
+            role: 'user',
+            content: `Summarize this conversation between Atlas (assistant) and JP (user). Focus on: decisions made, facts learned about JP, action items, and key topics discussed.\n\n${transcript}`,
+          }],
+          system: 'Write a concise summary (2-4 sentences). Focus on facts, decisions, and outcomes — not greetings or pleasantries.',
+          depth: 'fast',
+          maxTokens: 512,
+        });
+
+        const summary = extractTextContent(response.content).trim();
+        if (!summary) continue;
+
+        // Update conversation with summary and close it
+        await query(
+          `UPDATE conversations SET summary = $1, status = 'closed', updated_at = NOW() WHERE id = $2`,
+          [summary, conv.id]
+        );
+
+        // Store summary as semantic memory for cross-conversation recall
+        await storeSemanticMemory(
+          summary,
+          'conversation_summary',
+          conv.id,
+          { conversationType: 'auto_summary' },
+        );
+
+        logger.info('Stale conversation summarized', { conversationId: conv.id, summaryLength: summary.length });
+      } catch (err) {
+        logger.debug('Failed to summarize stale conversation', { conversationId: conv.id, error: err });
+      }
+    }
+  } catch (err) {
+    logger.debug('Stale conversation scan failed', { error: err });
+  }
 }
