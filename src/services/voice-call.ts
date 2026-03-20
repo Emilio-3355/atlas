@@ -292,8 +292,8 @@ export async function initiateOutboundCall(
   return call.sid;
 }
 
-export function getOutboundGreeting(purpose: string): string {
-  return `Hi, this is Atlas calling on behalf of JP. ${purpose}`;
+export function getOutboundGreeting(_purpose: string): string {
+  return `Hi, this is Atlas calling on behalf of JP. How are you doing?`;
 }
 
 export function getCallMeta(callSid: string): CallMeta | undefined {
