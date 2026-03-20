@@ -29,9 +29,9 @@ interface ClaudeResponse {
 }
 
 const MODEL_CONFIG: Record<ReasoningDepth, { model: string; maxTokens: number }> = {
-  fast: { model: 'claude-sonnet-4-6', maxTokens: 1024 },
-  deep: { model: 'claude-sonnet-4-6', maxTokens: 4096 },
-  expert: { model: 'claude-opus-4-6', maxTokens: 8192 },
+  fast: { model: 'claude-sonnet-4-6', maxTokens: 2048 },
+  deep: { model: 'claude-sonnet-4-6', maxTokens: 8192 },
+  expert: { model: 'claude-opus-4-6', maxTokens: 16384 },
 };
 
 const MAX_RETRIES = 2;

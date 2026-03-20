@@ -78,6 +78,38 @@ async function start() {
   logger.info('Connecting to Redis...');
   await connectRedis();
 
+  // === Memory Health Check — detect broken memory BEFORE serving requests ===
+  try {
+    const { query: dbQuery } = await import('./config/database.js');
+    // Test structured memory (pg_trgm)
+    try {
+      await dbQuery(`SELECT similarity('test', 'test')`);
+      logger.info('✓ pg_trgm extension available (structured memory search works)');
+    } catch {
+      logger.error('✗ pg_trgm NOT available — structured memory search (searchFacts) will FAIL silently. Run: CREATE EXTENSION IF NOT EXISTS pg_trgm;');
+    }
+    // Test memory_facts table
+    try {
+      const factCount = await dbQuery('SELECT COUNT(*) AS count FROM memory_facts');
+      logger.info(`✓ memory_facts table OK (${factCount.rows[0].count} facts stored)`);
+    } catch {
+      logger.error('✗ memory_facts table missing — memory will not work');
+    }
+    // Test semantic memory (OpenAI embeddings — optional, not required)
+    try {
+      const { isEmbeddingAvailable } = await import('./services/embedding.js');
+      if (isEmbeddingAvailable()) {
+        logger.info('✓ OpenAI embeddings available (semantic search enhanced)');
+      } else {
+        logger.info('ℹ Embeddings disabled (no OpenAI key) — memory uses keyword search. This is fine.');
+      }
+    } catch (err: any) {
+      logger.info('ℹ Embeddings unavailable — memory uses keyword search');
+    }
+  } catch (err) {
+    logger.warn('Memory health check skipped', { error: err });
+  }
+
   // Register tools
   await registerBuiltInToolsAsync();
 

@@ -2,6 +2,7 @@ import type { ToolDefinition, ToolResult, ToolContext } from '../../types/index.
 import { createPageWithCookies, safeClosePage, saveCookies } from '../../services/browser.js';
 import { query } from '../../config/database.js';
 import { tagContent } from '../../security/content-trust.js';
+import { encryptIfAvailable, decryptGraceful } from '../../security/crypto.js';
 import logger from '../../utils/logger.js';
 
 // ===== Known site configs (shortcuts — but generic login works for any URL) =====
@@ -38,12 +39,14 @@ async function storeCredentials(site: string, username: string, password: string
      DO UPDATE SET value = $2, metadata = $3, updated_at = NOW()`,
     [site, username, JSON.stringify({ stored_at: new Date().toISOString() })]
   );
+  // Encrypt password before storing
+  const encryptedPassword = encryptIfAvailable(password);
   await query(
     `INSERT INTO memory_facts (category, key, value, source, confidence, metadata)
      VALUES ('site_credentials_secret', $1, $2, 'jp_provided', 1.0, '{}')
      ON CONFLICT (category, key)
      DO UPDATE SET value = $2, updated_at = NOW()`,
-    [site, password]
+    [site, encryptedPassword]
   );
 }
 
@@ -53,7 +56,23 @@ async function getCredentials(site: string): Promise<{ username: string; passwor
     query(`SELECT value FROM memory_facts WHERE category = 'site_credentials_secret' AND key = $1`, [site]),
   ]);
   if (userResult.rows.length === 0 || passResult.rows.length === 0) return null;
-  return { username: userResult.rows[0].value, password: passResult.rows[0].value };
+
+  // Decrypt password (graceful: handles old plaintext values)
+  const storedPassword = passResult.rows[0].value;
+  const { plaintext: password, wasEncrypted } = decryptGraceful(storedPassword);
+
+  // Re-encrypt if it was plaintext (one-time migration)
+  if (!wasEncrypted) {
+    const encrypted = encryptIfAvailable(password);
+    if (encrypted !== password) {
+      await query(
+        `UPDATE memory_facts SET value = $1, updated_at = NOW() WHERE category = 'site_credentials_secret' AND key = $2`,
+        [encrypted, site]
+      ).catch((err) => logger.debug('Failed to re-encrypt credential', { site, error: err }));
+    }
+  }
+
+  return { username: userResult.rows[0].value, password };
 }
 
 // ===== Generic login engine =====

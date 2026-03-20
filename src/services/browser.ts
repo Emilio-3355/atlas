@@ -78,6 +78,73 @@ async function initCookies(): Promise<void> {
 // Initialize cookies on module load
 initCookies().catch(() => {});
 
+// ─── Session Persistence ─────────────────────────────────────────
+// Keeps browser pages alive between tool calls so multi-step tasks
+// (e.g., login → navigate → fill form) don't lose state.
+
+interface ActiveSession {
+  page: Page;
+  lastUsed: number;
+}
+
+const activeSessions = new Map<string, ActiveSession>();
+const SESSION_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+/** Register a page to keep alive between tool calls */
+export function keepAlive(conversationId: string, page: Page): void {
+  activeSessions.set(conversationId, { page, lastUsed: Date.now() });
+  logger.debug('Session kept alive', { conversationId });
+}
+
+/** Get an existing active page for a conversation (if still alive and < 5min old) */
+export function getActivePage(conversationId: string): Page | null {
+  const session = activeSessions.get(conversationId);
+  if (!session) return null;
+
+  // Check TTL
+  if (Date.now() - session.lastUsed > SESSION_TTL_MS) {
+    safeClosePage(session.page).catch(() => {});
+    activeSessions.delete(conversationId);
+    return null;
+  }
+
+  // Check if page is still usable
+  try {
+    if (session.page.isClosed()) {
+      activeSessions.delete(conversationId);
+      return null;
+    }
+  } catch {
+    activeSessions.delete(conversationId);
+    return null;
+  }
+
+  session.lastUsed = Date.now();
+  return session.page;
+}
+
+/** Release and close a session */
+export async function releaseSession(conversationId: string): Promise<void> {
+  const session = activeSessions.get(conversationId);
+  if (session) {
+    await safeClosePage(session.page);
+    activeSessions.delete(conversationId);
+    logger.debug('Session released', { conversationId });
+  }
+}
+
+// Periodic cleanup of abandoned sessions (every 60s)
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, session] of activeSessions) {
+    if (now - session.lastUsed > SESSION_TTL_MS) {
+      safeClosePage(session.page).catch(() => {});
+      activeSessions.delete(id);
+      logger.debug('Abandoned session cleaned up', { conversationId: id });
+    }
+  }
+}, 60_000);
+
 // Modern User-Agent — matches real Chrome to avoid bot detection
 const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 

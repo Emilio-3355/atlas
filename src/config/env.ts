@@ -39,6 +39,8 @@ const envSchema = z.object({
   SLACK_SIGNING_SECRET: z.string().default(''),
   SLACK_APP_TOKEN: z.string().default(''),
 
+  CREDENTIAL_ENCRYPTION_KEY: z.string().default(''),
+
   LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug']).default('info'),
 });
 

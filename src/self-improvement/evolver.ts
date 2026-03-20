@@ -370,10 +370,18 @@ async function filterCooldowns(proposals: Proposal[]): Promise<Proposal[]> {
   const filtered: Proposal[] = [];
 
   for (const p of proposals) {
+    // Check both tool_definitions (legacy) AND evolution_events for recent rejections
     const result = await query(
-      `SELECT id FROM tool_definitions
-       WHERE name = $1 AND status = 'rejected' AND proposed_at > NOW() - INTERVAL '1 day' * $2`,
-      [p.name, COOLDOWN_DAYS]
+      `SELECT id FROM (
+         SELECT id FROM tool_definitions
+         WHERE name = $1 AND status = 'rejected' AND proposed_at > NOW() - INTERVAL '1 day' * $2
+         UNION ALL
+         SELECT id FROM evolution_events
+         WHERE outcome = 'rejected'
+           AND proposals::text LIKE $3
+           AND created_at > NOW() - INTERVAL '1 day' * $2
+       ) AS combined LIMIT 1`,
+      [p.name, COOLDOWN_DAYS, `%${p.name}%`]
     );
 
     if (result.rows.length === 0) {

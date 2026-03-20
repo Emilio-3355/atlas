@@ -50,9 +50,18 @@ const policies: Record<string, ToolPolicy> = {
         /^file:\/\//i,          // No local file access
         /^javascript:/i,        // No JS execution
         /^data:text\/html/i,    // No data URL HTML injection
-        /localhost|127\.0\.0\.1|0\.0\.0\.0/i, // No SSRF to internal services
-        /169\.254\./,           // No AWS metadata
-        /10\.\d+\.\d+\.\d+/,   // No internal networks
+        /localhost|127\.\d+\.\d+\.\d+/i, // No SSRF to any loopback (127.0.0.0/8)
+        /\b0\.0\.0\.0\b/,              // No unspecified address
+        /\[?::1\]?/,                   // No IPv6 loopback
+        /0x7f[0-9a-f]{6}/i,           // No hex-encoded 127.x.x.x
+        /0177\.\d+\.\d+\.\d+/,        // No octal-encoded loopback
+        /%6c%6f%63%61%6c%68%6f%73%74/i, // No URL-encoded "localhost"
+        /%31%32%37/i,                  // No URL-encoded "127" in IP
+        /\b2130706433\b/,             // No decimal representation of 127.0.0.1
+        /169\.254\./,                  // No AWS metadata / link-local
+        /10\.\d+\.\d+\.\d+/,          // No 10.x private
+        /172\.(1[6-9]|2\d|3[01])\.\d+\.\d+/, // No 172.16-31.x private
+        /192\.168\.\d+\.\d+/,         // No 192.168.x private
       ],
     }],
   },
@@ -152,9 +161,8 @@ export function checkToolPolicy(toolName: string, input: Record<string, any>): {
 
   // Unknown tools — deny by default (NemoClaw principle)
   if (!policy) {
-    // Allow dynamically-generated tools (code_forge output) with default safe policy
-    logger.debug('No policy for tool — allowing with default', { tool: toolName });
-    return { allowed: true };
+    logger.warn('Unknown tool denied by policy', { tool: toolName });
+    return { allowed: false, reason: `Unknown tool '${toolName}' denied by default policy` };
   }
 
   if (!policy.allowed) {
@@ -179,7 +187,11 @@ export function checkToolPolicy(toolName: string, input: Record<string, any>): {
   if (policy.inputRules) {
     for (const rule of policy.inputRules) {
       const value = input[rule.field];
-      if (typeof value !== 'string') continue;
+      // Block non-string inputs — arrays/objects/null can bypass pattern checks
+      if (value === undefined) continue; // Field not provided — skip
+      if (typeof value !== 'string') {
+        return { allowed: false, reason: `Input ${rule.field} must be a string, got ${value === null ? 'null' : typeof value}` };
+      }
 
       if (rule.maxLength && value.length > rule.maxLength) {
         return { allowed: false, reason: `Input ${rule.field} exceeds max length (${rule.maxLength})` };

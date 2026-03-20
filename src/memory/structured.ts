@@ -42,15 +42,29 @@ export async function getFactsByCategory(category: string): Promise<MemoryFact[]
 }
 
 export async function searchFacts(searchText: string, limit: number = 10): Promise<MemoryFact[]> {
-  const result = await query(
-    `SELECT *, similarity(value, $1) AS sim FROM memory_facts
-     WHERE (expires_at IS NULL OR expires_at > NOW())
-       AND (value ILIKE $2 OR key ILIKE $2 OR similarity(value, $1) > 0.1)
-     ORDER BY sim DESC
-     LIMIT $3`,
-    [searchText, `%${searchText}%`, limit]
-  );
-  return result.rows.map(mapRow);
+  try {
+    // Try pg_trgm similarity search (best quality)
+    const result = await query(
+      `SELECT *, similarity(value, $1) AS sim FROM memory_facts
+       WHERE (expires_at IS NULL OR expires_at > NOW())
+         AND (value ILIKE $2 OR key ILIKE $2 OR similarity(value, $1) > 0.1)
+       ORDER BY sim DESC
+       LIMIT $3`,
+      [searchText, `%${searchText}%`, limit]
+    );
+    return result.rows.map(mapRow);
+  } catch {
+    // Fallback: ILIKE only (works without pg_trgm extension)
+    const result = await query(
+      `SELECT * FROM memory_facts
+       WHERE (expires_at IS NULL OR expires_at > NOW())
+         AND (value ILIKE $1 OR key ILIKE $1 OR category ILIKE $1)
+       ORDER BY updated_at DESC
+       LIMIT $2`,
+      [`%${searchText}%`, limit]
+    );
+    return result.rows.map(mapRow);
+  }
 }
 
 export async function deleteFact(category: string, key: string): Promise<boolean> {

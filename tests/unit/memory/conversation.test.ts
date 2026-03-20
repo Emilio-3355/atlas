@@ -24,13 +24,15 @@ beforeEach(() => {
 });
 
 describe('shouldCompact', () => {
-  it('returns false when message_count < 40', async () => {
-    mockQuery.mockResolvedValueOnce({ rows: [{ message_count: 20 }] });
+  it('returns false when message_count < 80 and content is small', async () => {
+    mockQuery
+      .mockResolvedValueOnce({ rows: [{ message_count: 20 }] })
+      .mockResolvedValueOnce({ rows: [{ total_chars: 1000 }] });
     expect(await shouldCompact('conv-1')).toBe(false);
   });
 
-  it('returns true when message_count >= 40', async () => {
-    mockQuery.mockResolvedValueOnce({ rows: [{ message_count: 40 }] });
+  it('returns true when message_count >= 80', async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [{ message_count: 80 }] });
     expect(await shouldCompact('conv-1')).toBe(true);
   });
 
@@ -47,17 +49,17 @@ describe('shouldCompact', () => {
 
 describe('compactConversation', () => {
   it('generates summary via callClaude when enough messages', async () => {
-    // getConversationMessages returns 15 messages (> KEEP_RECENT=10)
-    const messages = Array.from({ length: 15 }, (_, i) => ({
+    // getConversationMessages returns 25 messages (> KEEP_RECENT=20)
+    const messages = Array.from({ length: 25 }, (_, i) => ({
       role: i % 2 === 0 ? 'user' : 'assistant',
       content: `message ${i}`,
-      created_at: new Date(Date.now() - (15 - i) * 60000),
+      created_at: new Date(Date.now() - (25 - i) * 60000),
     }));
     mockQuery
       .mockResolvedValueOnce({ rows: messages }) // getConversationMessages
       .mockResolvedValueOnce({ rows: [{ summary: 'Old summary' }] }) // get summary
       .mockResolvedValueOnce({ rows: [] }) // update summary
-      .mockResolvedValueOnce({ rows: [] }); // delete old messages
+      .mockResolvedValueOnce({ rows: [] }); // soft-delete old messages
 
     mockCallClaude.mockResolvedValueOnce({
       content: [{ type: 'text', text: 'New summary' }],
@@ -70,7 +72,7 @@ describe('compactConversation', () => {
   });
 
   it('returns empty string when <= KEEP_RECENT messages', async () => {
-    const messages = Array.from({ length: 5 }, (_, i) => ({
+    const messages = Array.from({ length: 15 }, (_, i) => ({
       role: 'user',
       content: `msg ${i}`,
       created_at: new Date(),

@@ -7,7 +7,7 @@ export const rememberTool: ToolDefinition = {
   name: 'remember',
   description: 'Store a fact, preference, or piece of information in Atlas\'s memory. Use for things JP tells you to remember. Requires approval.',
   category: 'action',
-  requiresApproval: true,
+  requiresApproval: false, // No friction — JP tells Atlas to remember, Atlas remembers. Period.
   inputSchema: {
     type: 'object' as const,
     properties: {
@@ -31,15 +31,24 @@ export const rememberTool: ToolDefinition = {
 
   async execute(input: { category: string; key: string; value: string; semantic?: boolean }, ctx: ToolContext): Promise<ToolResult> {
     try {
+      // ALWAYS store structured fact first — this is the critical path
       const fact = await upsertFact(input.category, input.key, input.value, 'jp_told');
 
-      // Also store as semantic memory for similarity search
+      // Also store as semantic memory (non-blocking — don't fail the whole tool if embeddings are broken)
       if (input.semantic !== false) {
-        await storeSemanticMemory(
-          `[${input.category}] ${input.key}: ${input.value}`,
-          'jp_told',
-          ctx.conversationId,
-        );
+        try {
+          await storeSemanticMemory(
+            `[${input.category}] ${input.key}: ${input.value}`,
+            'jp_told',
+            ctx.conversationId,
+          );
+        } catch (semanticErr) {
+          // Structured fact is saved — semantic is bonus. Log and continue.
+          logger.warn('Semantic memory storage failed (structured fact saved OK)', {
+            error: semanticErr instanceof Error ? semanticErr.message : String(semanticErr),
+            key: input.key,
+          });
+        }
       }
 
       return {
