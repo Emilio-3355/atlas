@@ -59,12 +59,12 @@ function debugAuth(c: any): boolean {
   return provided === token;
 }
 
-// Debug: dump conversation messages for the active Telegram conversation
+// Debug: dump conversation messages for the most recent active conversation (any channel)
 healthRouter.get('/debug/messages', async (c) => {
   if (!debugAuth(c)) return c.json({ error: 'Unauthorized' }, 401);
   try {
     const conv = await query(
-      `SELECT * FROM conversations WHERE user_phone LIKE 'tg:%' AND status = 'active'
+      `SELECT * FROM conversations WHERE status = 'active'
        ORDER BY updated_at DESC LIMIT 1`
     );
     if (conv.rows.length === 0) return c.json({ error: 'No active telegram conversation' });
@@ -81,6 +81,34 @@ healthRouter.get('/debug/messages', async (c) => {
       conversation: { id: convId, phone: conv.rows[0].user_phone, messageCount: conv.rows[0].message_count },
       messages: msgs.rows,
     });
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// Debug: recent tool usage
+healthRouter.get('/debug/tools', async (c) => {
+  if (!debugAuth(c)) return c.json({ error: 'Unauthorized' }, 401);
+  try {
+    const tools = await query(
+      `SELECT tool_name, success, duration_ms, LEFT(error_message, 200) as error_preview, created_at
+       FROM tool_usage ORDER BY created_at DESC LIMIT 20`
+    );
+    return c.json({ recentToolCalls: tools.rows });
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// Debug: all recent conversations
+healthRouter.get('/debug/conversations', async (c) => {
+  if (!debugAuth(c)) return c.json({ error: 'Unauthorized' }, 401);
+  try {
+    const convs = await query(
+      `SELECT id, user_phone, status, message_count, language, updated_at
+       FROM conversations ORDER BY updated_at DESC LIMIT 10`
+    );
+    return c.json({ conversations: convs.rows });
   } catch (err) {
     return c.json({ error: err instanceof Error ? err.message : String(err) });
   }
